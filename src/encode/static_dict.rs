@@ -7,25 +7,32 @@
 //! Which word gets each hash slot is ours: the shortest, then the most common (the lowest
 //! index, the dictionary's order). The reference picks with a tuned table
 //! (`c/enc/dictionary_hash.c`); ours is built from the dictionary alone.
+//!
+//! From quality 5 the reference looks up a second word per hash too, one of 4 to 7 bytes, as
+//! its table has a slot for each (`c/enc/encoder_dict.c`, `BuildDictionaryHashTable`, files
+//! words that way). Ours is again the shortest, then the most common, of those. Among the
+//! rules tried for it, this one is the smallest by far (see B12 in `docs/plan/README.md`).
 
 use std::sync::OnceLock;
 
-use crate::dictionary::{self, Kind, MAX_WORD};
+use crate::dictionary::{self, Kind, MAX_WORD, MIN_WORD};
 use crate::dictionary_tables::{NDBITS, TRANSFORMS};
 use crate::encode::command::MAX_DISTANCE;
 use crate::encode::hash::{Match, match_length, score};
 
 /// Bits of the hash of a word's first 4 bytes.
 const HASH_BITS: u32 = 14;
-/// The shortest word looked up.
+/// The shortest word in the first slot; the second holds the shorter ones.
 const MIN_LOOKUP: usize = 8;
 /// How many bytes may be cut off the end of a word: transforms `OmitLast1` to `OmitLast9`.
 const MAX_CUT: usize = 9;
 
-/// The lookup table: per hash, a word (its length, 0 for none, and index), and per number of
-/// bytes cut, the transform that cuts them.
+/// The lookup table: per hash, a word of 8 bytes or more (its length, 0 for none, and index)
+/// and one of 4 to 7, and per number of bytes cut, the transform that cuts them.
 struct Lookup {
     slots: Box<[(u8, u16)]>,
+    /// The short word per hash, for the searches of quality 5 and up.
+    second: Box<[(u8, u16)]>,
     cuts: [u16; MAX_CUT + 1],
 }
 
@@ -41,14 +48,8 @@ fn lookup() -> &'static Lookup {
 }
 
 fn build() -> Lookup {
-    let mut slots = vec![(0u8, 0u16); 1 << HASH_BITS].into_boxed_slice();
-    // Longest first and highest index first, so the shortest and most common word of each
-    // hash is written last and stays.
-    for len in (MIN_LOOKUP..=MAX_WORD).rev() {
-        for index in (0..dictionary::word_count(len)).rev() {
-            slots[hash14(dictionary::word(len, index))] = (len as u8, index as u16);
-        }
-    }
+    let slots = fill(MIN_LOOKUP..=MAX_WORD);
+    let second = fill(MIN_WORD..=MIN_LOOKUP - 1);
     let mut cuts = [0u16; MAX_CUT + 1];
     for (cut, transform) in cuts.iter_mut().enumerate() {
         let kind = if cut == 0 {
@@ -62,7 +63,24 @@ fn build() -> Lookup {
             .position(|t| t.0.is_empty() && t.1 == kind && t.2.is_empty())
             .unwrap_or(0) as u16;
     }
-    Lookup { slots, cuts }
+    Lookup {
+        slots,
+        second,
+        cuts,
+    }
+}
+
+/// Per hash, the shortest and then most common word of the lengths `lens`.
+fn fill(lens: std::ops::RangeInclusive<usize>) -> Box<[(u8, u16)]> {
+    let mut slots = vec![(0u8, 0u16); 1 << HASH_BITS].into_boxed_slice();
+    // Longest first and highest index first, so the shortest and most common word of each
+    // hash is written last and stays.
+    for len in lens.rev() {
+        for index in (0..dictionary::word_count(len)).rev() {
+            slots[hash14(dictionary::word(len, index))] = (len as u8, index as u16);
+        }
+    }
+    slots
 }
 
 /// Builds the lookup table now rather than at the first dictionary search.
@@ -105,9 +123,41 @@ impl Search {
         if self.matches < self.lookups >> 7 {
             return;
         }
+        let slot = self.table.slots[hash14(data)];
+        self.try_word(slot, data, max_length, max_backward, best);
+    }
+
+    /// [`search`](Self::search) with two words per hash, as from quality 5 (the reference's
+    /// `SearchInStaticDictionary` with `shallow` false): the long word, then the short one,
+    /// each a lookup of its own. The short one wins a tie.
+    pub(crate) fn search_deep(
+        &mut self,
+        data: &[u8],
+        max_length: usize,
+        max_backward: usize,
+        best: &mut Match,
+    ) {
+        if self.matches < self.lookups >> 7 {
+            return;
+        }
+        let key = hash14(data);
+        let (first, second) = (self.table.slots[key], self.table.second[key]);
+        self.try_word(first, data, max_length, max_backward, best);
+        self.try_word(second, data, max_length, max_backward, best);
+    }
+
+    /// One lookup: the word in `slot` (length 0 for none), whole or cut, into `best` if it
+    /// scores at least as well.
+    #[inline(always)]
+    fn try_word(
+        &mut self,
+        (len, index): (u8, u16),
+        data: &[u8],
+        max_length: usize,
+        max_backward: usize,
+        best: &mut Match,
+    ) {
         self.lookups += 1;
-        let table = self.table;
-        let (len, index) = table.slots[hash14(data)];
         let (len, index) = (len as usize, index as usize);
         if len == 0 || len > max_length {
             return;
@@ -116,7 +166,7 @@ impl Search {
         if matched == 0 || matched + MAX_CUT < len {
             return;
         }
-        let transform = usize::from(table.cuts[len - matched]);
+        let transform = usize::from(self.table.cuts[len - matched]);
         let distance = max_backward + 1 + index + (transform << NDBITS[len]);
         if distance > MAX_DISTANCE as usize {
             return;
@@ -166,18 +216,63 @@ mod tests {
     #[test]
     fn each_slot_holds_its_shortest_most_common_word() {
         let table = build();
-        for len in MIN_LOOKUP..=dictionary::MAX_WORD {
-            for index in 0..dictionary::word_count(len) {
-                let (l, i) = table.slots[hash14(dictionary::word(len, index))];
-                assert!(
-                    (l as usize, i as usize) <= (len, index),
-                    "length {len} word {index} lost to length {l} word {i}"
-                );
+        for (slots, lens) in [
+            (&table.slots, MIN_LOOKUP..=dictionary::MAX_WORD),
+            (&table.second, dictionary::MIN_WORD..=MIN_LOOKUP - 1),
+        ] {
+            for len in lens.clone() {
+                for index in 0..dictionary::word_count(len) {
+                    let (l, i) = slots[hash14(dictionary::word(len, index))];
+                    assert!(
+                        lens.contains(&(l as usize)) && (l as usize, i as usize) <= (len, index),
+                        "length {len} word {index} lost to length {l} word {i}"
+                    );
+                }
             }
         }
         // 7,616 words of 8 bytes or more, with 2,376 different first 4 bytes.
         let used = table.slots.iter().filter(|s| s.0 != 0).count();
         assert!(used > 2000, "{used} slots used");
+        let used = table.second.iter().filter(|s| s.0 != 0).count();
+        assert!(used > 2000, "{used} short slots used");
+    }
+
+    #[test]
+    fn the_deep_search_finds_short_words_too() {
+        let table = build();
+        // A short word whose hash has no long word, then a long word's hash with a short one.
+        let only_short = (0..table.second.len())
+            .find(|&k| table.second[k].0 != 0 && table.slots[k].0 == 0)
+            .unwrap();
+        let (len, index) = table.second[only_short];
+        let mut data = dictionary::word(usize::from(len), usize::from(index)).to_vec();
+        data.extend_from_slice(b"##########");
+        let mut best = fresh();
+        let mut search = Search::default();
+        search.search(&data, data.len(), 1000, &mut best);
+        assert_eq!(best, fresh(), "quality 4 doesn't look");
+        assert_eq!(search.lookups, 1);
+        search.search_deep(&data, data.len(), 1000, &mut best);
+        assert_eq!(best.len, usize::from(len));
+        assert_eq!(best.distance, 1000 + 1 + usize::from(index));
+        assert_eq!(search.lookups, 3, "a lookup per word");
+        // Where both match, the longer copy wins.
+        let both = (0..table.second.len())
+            .find(|&k| {
+                let (l, i) = table.slots[k];
+                let (sl, si) = table.second[k];
+                l != 0
+                    && sl != 0
+                    && dictionary::word(usize::from(l), usize::from(i))
+                        .starts_with(dictionary::word(usize::from(sl), usize::from(si)))
+            })
+            .unwrap();
+        let (len, index) = table.slots[both];
+        let mut data = dictionary::word(usize::from(len), usize::from(index)).to_vec();
+        data.extend_from_slice(b"##########");
+        let mut best = fresh();
+        Search::default().search_deep(&data, data.len(), 1000, &mut best);
+        assert_eq!(best.len, usize::from(len));
     }
 
     fn fresh() -> Match {

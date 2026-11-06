@@ -16,6 +16,7 @@
 //! `2^(lgwin + 1) + 2^(1 + max(lgwin, 16)) + 2^16` bytes, 16 MiB at the default window.
 
 use crate::bitwriter::{BitWriter, Pending};
+use crate::encode::Level;
 use crate::encode::matcher::{Encoder, INPUT_BLOCK, WINDOW_GAP, max_meta_block};
 use crate::encode::{write_empty_last, write_window};
 
@@ -32,6 +33,8 @@ pub(crate) struct Stream {
     lgwin: u32,
     /// The window for the next stream.
     next_lgwin: u32,
+    /// The level for the next stream.
+    next_level: Level,
     size_hint: Option<usize>,
     encoder: Encoder,
     /// The window and the input not yet written: `buffer[processed..]` is the start of the
@@ -45,13 +48,14 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
-    pub(crate) fn new(lgwin: u32, size_hint: Option<usize>) -> Self {
+    pub(crate) fn new(lgwin: u32, level: Level, size_hint: Option<usize>) -> Self {
         Self {
             lgwin,
             next_lgwin: lgwin,
+            next_level: level,
             size_hint,
             // The smallest table: the stream's own is made at its first call.
-            encoder: Encoder::new(Some(0), lgwin),
+            encoder: Encoder::new(Some(0), lgwin, level),
             buffer: Vec::new(),
             processed: 0,
             pending: Pending::default(),
@@ -64,9 +68,10 @@ impl Stream {
         self.size_hint = size_hint;
     }
 
-    /// The window for the next stream.
-    pub(crate) fn set_lgwin(&mut self, lgwin: u32) {
+    /// The window and level for the next stream.
+    pub(crate) fn set_options(&mut self, lgwin: u32, level: Level) {
         self.next_lgwin = lgwin;
+        self.next_level = level;
     }
 
     /// Drops the stream under way, if any.
@@ -80,7 +85,8 @@ impl Stream {
             return;
         }
         self.lgwin = self.next_lgwin;
-        self.encoder.reset(self.size_hint, self.lgwin);
+        self.encoder
+            .reset(self.size_hint, self.lgwin, self.next_level);
         self.buffer.clear();
         // Room for the stream hinted, up to what the buffer ever holds.
         let most = (2 << self.lgwin) + max_meta_block(self.lgwin) + INPUT_BLOCK + 1;
@@ -188,6 +194,7 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::Stream;
+    use crate::encode::Level;
     use crate::encode::matcher::compress;
 
     fn text(len: usize) -> Vec<u8> {
@@ -218,8 +225,8 @@ mod tests {
         ] {
             let src = text(len);
             let mut whole = Vec::new();
-            compress(&src, lgwin, &mut whole);
-            let mut s = Stream::new(lgwin, Some(len));
+            compress(&src, lgwin, Level::Q4, &mut whole);
+            let mut s = Stream::new(lgwin, Level::Q4, Some(len));
             let mut out = Vec::new();
             for piece in src.chunks(chunk) {
                 s.write(piece, &mut out);
@@ -234,7 +241,7 @@ mod tests {
         let lgwin = 16;
         let bound = (2 << lgwin) + super::max_meta_block(lgwin) + super::INPUT_BLOCK + 1;
         let src = text(3 << 20);
-        let mut s = Stream::new(lgwin, None);
+        let mut s = Stream::new(lgwin, Level::Q4, None);
         let mut out = Vec::new();
         let mut most = 0;
         for (i, piece) in src.chunks(10_000).enumerate() {
@@ -258,7 +265,7 @@ mod tests {
         let lgwin = 16;
         let max_backward = (1 << lgwin) - super::WINDOW_GAP;
         let src = text(1 << 20);
-        let mut s = Stream::new(lgwin, None);
+        let mut s = Stream::new(lgwin, Level::Q4, None);
         let mut out = Vec::new();
         s.write(&src[..16], &mut out);
         let mut written = 16;
@@ -279,7 +286,7 @@ mod tests {
 
     #[test]
     fn two_flushes_add_nothing() {
-        let mut s = Stream::new(22, None);
+        let mut s = Stream::new(22, Level::Q4, None);
         let mut out = Vec::new();
         s.flush(&mut out);
         // The window header and an empty metadata block, padded.

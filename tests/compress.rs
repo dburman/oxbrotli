@@ -11,29 +11,31 @@ mod common;
 
 use common::{Rng, corpus, random, unbrotli};
 
-fn options(lgwin: u32) -> oxbrotli::Options {
-    oxbrotli::Options::new(4).lgwin(lgwin)
-}
+/// Qualities that compress differently: 4, 5 and 6.
+const QUALITIES: [u32; 3] = [4, 5, 6];
 
 #[test]
-fn the_corpus_round_trips_at_every_window() {
+fn the_corpus_round_trips_at_every_quality_and_window() {
     let corpus = corpus();
     std::thread::scope(|s| {
-        for lgwin in 10..=24 {
-            let corpus = &corpus;
-            s.spawn(move || {
-                for (name, data) in corpus {
-                    let stream = oxbrotli::compress_with(data, options(lgwin));
-                    assert!(
-                        oxbrotli::decompress(&stream).unwrap() == *data,
-                        "{name} w{lgwin}: oxbrotli"
-                    );
-                    assert!(
-                        unbrotli(&stream).unwrap() == *data,
-                        "{name} w{lgwin}: brotli -d"
-                    );
-                }
-            });
+        for quality in QUALITIES {
+            for lgwin in 10..=24 {
+                let corpus = &corpus;
+                s.spawn(move || {
+                    for (name, data) in corpus {
+                        let options = oxbrotli::Options::new(quality).lgwin(lgwin);
+                        let stream = oxbrotli::compress_with(data, options);
+                        assert!(
+                            oxbrotli::decompress(&stream).unwrap() == *data,
+                            "{name} q{quality} w{lgwin}: oxbrotli"
+                        );
+                        assert!(
+                            unbrotli(&stream).unwrap() == *data,
+                            "{name} q{quality} w{lgwin}: brotli -d"
+                        );
+                    }
+                });
+            }
         }
     });
 }
@@ -87,7 +89,7 @@ fn skewed_literals_need_the_length_limit() {
 #[test]
 fn every_quality_gives_a_valid_stream() {
     let data = common::text(20_000, 3);
-    for quality in [0, 1, 4, 9, 11, 12, u32::MAX] {
+    for quality in [0, 1, 4, 5, 6, 9, 11, 12, u32::MAX] {
         let stream = oxbrotli::compress(&data, quality);
         assert_eq!(unbrotli(&stream).unwrap(), data, "quality {quality}");
     }

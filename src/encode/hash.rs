@@ -35,7 +35,7 @@ pub(crate) const H54: Params = Params {
 const SWEEP: usize = 4;
 const SWEEP_MASK: usize = (SWEEP - 1) << 3;
 /// The hash multiplier (the reference's `kHashMul64`).
-const HASH_MUL: u64 = 0x1fe3_5a7b_d357_9bd3;
+pub(crate) const HASH_MUL: u64 = 0x1fe3_5a7b_d357_9bd3;
 /// Bytes a hash reads.
 pub(crate) const HASH_READ: usize = 8;
 /// A hinted table has `2^SLOTS_PER_BYTE_BITS` slots per byte of the hint (up to the
@@ -58,8 +58,73 @@ pub(crate) fn score(len: usize, distance: usize) -> usize {
 }
 
 /// The score of a copy of `len` bytes from the last distance: cheaper than any other.
-fn last_distance_score(len: usize) -> usize {
+pub(crate) fn last_distance_score(len: usize) -> usize {
     SCORE_BASE + LITERAL_BYTE_SCORE * len + 15
+}
+
+/// What the match loop needs of a hasher. Generic, not dynamic: quality 4's loop compiles
+/// to what it was before there were others.
+pub(crate) trait Finder {
+    /// Bytes a position's hash reads (the reference's `HashTypeLength` and
+    /// `StoreLookahead`): a position this close to the end of the input isn't searched.
+    fn hash_len(&self) -> usize;
+    /// Whether the search one byte later starts from nothing, as from quality 5, rather than
+    /// from the match in hand cut by one (`MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH`).
+    const FRESH_LAZY: bool;
+    /// Files position `pos`.
+    fn store(&mut self, data: &[u8], pos: usize);
+    /// Files every position in `range`, in order.
+    fn store_range(&mut self, data: &[u8], range: std::ops::Range<usize>);
+    /// The best match for `data[cur..]`, up to `max_length` bytes and `max_backward` back,
+    /// into `best` if it beats it; then files `cur`.
+    fn find_longest_match(
+        &mut self,
+        data: &[u8],
+        ring: &crate::encode::command::Ring,
+        cur: usize,
+        max_length: usize,
+        max_backward: usize,
+        best: &mut Match,
+    );
+}
+
+impl Finder for Hasher {
+    fn hash_len(&self) -> usize {
+        HASH_READ
+    }
+
+    const FRESH_LAZY: bool = false;
+
+    #[inline(always)]
+    fn store(&mut self, data: &[u8], pos: usize) {
+        Hasher::store(self, data, pos);
+    }
+
+    #[inline(always)]
+    fn store_range(&mut self, data: &[u8], range: std::ops::Range<usize>) {
+        Hasher::store_range(self, data, range);
+    }
+
+    #[inline(always)]
+    fn find_longest_match(
+        &mut self,
+        data: &[u8],
+        ring: &crate::encode::command::Ring,
+        cur: usize,
+        max_length: usize,
+        max_backward: usize,
+        best: &mut Match,
+    ) {
+        Hasher::find_longest_match(
+            self,
+            data,
+            ring.last() as usize,
+            cur,
+            max_length,
+            max_backward,
+            best,
+        );
+    }
 }
 
 /// A match: `len` bytes from `distance` back, its length written as `len_code` (more than
@@ -104,6 +169,7 @@ pub(crate) fn match_length(a: &[u8], b: &[u8], limit: usize) -> usize {
 }
 
 /// The hash table, and the dictionary search that goes with it.
+#[derive(Default)]
 pub(crate) struct Hasher {
     buckets: Vec<u32>,
     mask: usize,
@@ -121,6 +187,7 @@ impl Hasher {
     /// A 1 KiB input gets 64 KiB, not 512 KiB, which is cheaper to clear. Fewer slots lose
     /// matches: at 2 per byte, a 4 KiB HTML body came out 0.5% larger, a 16 KiB one 0.6%.
     /// With no hint, the reference's size.
+    #[cfg(test)]
     pub(crate) fn new(params: Params, size_hint: Option<usize>) -> Self {
         let mut h = Self {
             buckets: Vec::new(),

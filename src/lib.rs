@@ -6,8 +6,10 @@
 //!
 //! **Status:** 0.1.1. Decompression works. Compression works at quality 4,
 //! as the reference compresses at quality 4: on our test corpus the output is the same size,
-//! give or take 0.2% per entry, in one go or as a stream ([`StreamCompressor`]). Every
-//! quality compresses as 4 does for now.
+//! give or take 0.2% per entry, in one go or as a stream ([`StreamCompressor`]). Qualities
+//! 0 to 3 compress as 4 does. Qualities 5 and 6 are in progress: they search further for
+//! matches, as the reference does, but don't yet model literals by context; 7 to 11 compress
+//! as 6 does.
 //!
 //! ```
 //! let text = b"Brotli in safe Rust. ".repeat(100);
@@ -32,6 +34,8 @@ mod encode;
 mod prefix;
 mod tables;
 
+use encode::Level;
+
 /// How to compress: see [`compress_with`].
 ///
 /// ```
@@ -42,8 +46,8 @@ mod tables;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Options {
-    /// The quality, 0 to 11 as in the reference `brotli`: higher is smaller and slower. For
-    /// now every quality compresses as 4 does.
+    /// The quality, 0 to 11 as in the reference `brotli`: higher is smaller and slower.
+    /// Qualities 0 to 3 compress as 4 does, and 7 to 11 as 6 does, for now.
     pub quality: u32,
     /// The window: back-references reach up to `2^lgwin - 16` bytes, and a decoder keeps that
     /// much of the output. 10 to 24; values outside are clamped. The default is 22, as the
@@ -98,8 +102,8 @@ impl Default for Options {
     }
 }
 
-/// Compresses `src` at `quality` (0 to 11; for now every quality compresses as 4 does) with
-/// the default window.
+/// Compresses `src` at `quality` (0 to 11; for now 0 to 3 compress as 4, and 7 to 11 as 6)
+/// with the default window.
 #[must_use]
 pub fn compress(src: &[u8], quality: u32) -> Vec<u8> {
     compress_with(src, Options::new(quality))
@@ -110,7 +114,7 @@ pub fn compress(src: &[u8], quality: u32) -> Vec<u8> {
 pub fn compress_with(src: &[u8], options: Options) -> Vec<u8> {
     let lgwin = options.lgwin.clamp(encode::MIN_LGWIN, encode::MAX_LGWIN);
     let mut out = Vec::new();
-    encode::matcher::compress(src, lgwin, &mut out);
+    encode::matcher::compress(src, lgwin, Level::from_quality(options.quality), &mut out);
     out
 }
 
@@ -147,7 +151,11 @@ impl StreamCompressor {
     pub fn new(options: Options, size_hint: Option<u64>) -> Self {
         let lgwin = options.lgwin.clamp(encode::MIN_LGWIN, encode::MAX_LGWIN);
         Self {
-            stream: encode::stream::Stream::new(lgwin, size_hint.map(hint)),
+            stream: encode::stream::Stream::new(
+                lgwin,
+                Level::from_quality(options.quality),
+                size_hint.map(hint),
+            ),
         }
     }
 
@@ -161,8 +169,10 @@ impl StreamCompressor {
     /// or before the first write), so that one compressor can take each stream at its own
     /// window, such as [`Options::for_size`] gives it. The stream under way keeps its window.
     pub fn set_options(&mut self, options: Options) {
-        self.stream
-            .set_lgwin(options.lgwin.clamp(encode::MIN_LGWIN, encode::MAX_LGWIN));
+        self.stream.set_options(
+            options.lgwin.clamp(encode::MIN_LGWIN, encode::MAX_LGWIN),
+            Level::from_quality(options.quality),
+        );
     }
 
     /// Drops the stream under way, if any, without ending it: ready for a new one, with its

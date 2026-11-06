@@ -40,9 +40,10 @@ fn any_chunks_decode_to_the_input() {
                     if chunk == 1 && data.len() > 200_000 {
                         continue;
                     }
-                    for lgwin in [10, 16, 22] {
-                        let out = stream_in_chunks(data, Options::new(4).lgwin(lgwin), chunk);
-                        let what = format!("{name} w{lgwin} in chunks of {chunk}");
+                    for (quality, lgwin) in [(4, 10), (4, 16), (4, 22), (5, 10), (6, 22)] {
+                        let options = Options::new(quality).lgwin(lgwin);
+                        let out = stream_in_chunks(data, options, chunk);
+                        let what = format!("{name} q{quality} w{lgwin} in chunks of {chunk}");
                         assert!(oxbrotli::decompress(&out).unwrap() == *data, "{what}");
                         assert!(unbrotli(&out).unwrap() == *data, "{what}: brotli -d");
                     }
@@ -54,9 +55,11 @@ fn any_chunks_decode_to_the_input() {
 
 #[test]
 fn without_flushes_a_stream_is_the_one_shot_stream() {
+    // At window 10 the stream drops what is out of reach, and moves the hash table's
+    // positions down, as the one-shot compressor never does.
     for (name, data) in small_corpus() {
-        for lgwin in [10, 19] {
-            let options = Options::new(4).lgwin(lgwin);
+        for (quality, lgwin) in [(4, 10), (4, 19), (5, 10), (5, 19), (6, 10), (6, 19)] {
+            let options = Options::new(quality).lgwin(lgwin);
             let mut c = StreamCompressor::new(options, Some(data.len() as u64));
             let mut out = Vec::new();
             for piece in data.chunks(10_000) {
@@ -65,7 +68,7 @@ fn without_flushes_a_stream_is_the_one_shot_stream() {
             c.finish(&mut out);
             assert!(
                 out == oxbrotli::compress_with(&data, options),
-                "{name} w{lgwin}"
+                "{name} q{quality} w{lgwin}"
             );
         }
     }
@@ -112,8 +115,8 @@ fn check_flushes(data: &[u8], options: Options, seed: u64, reference_every: usiz
 #[test]
 fn after_each_flush_the_output_so_far_decodes() {
     let data = html(600_000, 11);
-    for (lgwin, seed) in [(10, 1), (16, 2), (22, 3)] {
-        check_flushes(&data, Options::new(4).lgwin(lgwin), seed, 5);
+    for (quality, lgwin, seed) in [(4, 10, 1), (4, 16, 2), (4, 22, 3), (5, 10, 4), (6, 22, 5)] {
+        check_flushes(&data, Options::new(quality).lgwin(lgwin), seed, 5);
     }
     // Noise, stored uncompressed and so already on byte boundaries.
     check_flushes(&common::random(200_000, 4), Options::new(4), 5, 3);
@@ -200,6 +203,27 @@ fn a_reused_compressor_writes_what_a_fresh_one_does() {
         one_stream(&mut c, &second) == one_stream(&mut hinted, &second),
         "hinted"
     );
+}
+
+#[test]
+fn a_reused_compressor_takes_each_stream_at_its_own_quality() {
+    let data = html(100_000, 12);
+    let fresh = |quality: u32| {
+        one_stream(
+            &mut StreamCompressor::new(Options::new(quality).lgwin(18), None),
+            &data,
+        )
+    };
+    let mut c = StreamCompressor::new(Options::new(4).lgwin(18), None);
+    for quality in [4, 5, 6, 4, 6, 5] {
+        c.set_options(Options::new(quality).lgwin(18));
+        let out = one_stream(&mut c, &data);
+        assert!(out == fresh(quality), "quality {quality}");
+        assert!(
+            oxbrotli::decompress(&out).unwrap() == data,
+            "quality {quality}"
+        );
+    }
 }
 
 #[test]

@@ -22,9 +22,11 @@ separate implementation from the RFC:
 
 **Status:** 0.1.1. Decompression is complete: everything the reference
 writes, at every quality and window, decodes byte for byte, and damaged input gives an error.
-Compression works at quality 4 (every quality compresses as 4 does for now): on the test
-corpus its output is the size of `brotli -q 4`'s, give or take 0.2% per entry, and the
-reference decodes everything it writes, in one go or as a stream with flushes. Both
+Compression works at quality 4 (0 to 3 compress as 4 does): on the test corpus its output is
+the size of `brotli -q 4`'s, give or take 0.2% per entry, and the reference decodes
+everything it writes, in one go or as a stream with flushes. Qualities 5 and 6 are in
+progress (7 to 11 compress as 6 does): their match search is the reference's, and the
+reference decodes what they write, but literals aren't yet modeled by context. Both
 directions run at about the reference's speed ([`docs/benchmarks.md`](docs/benchmarks.md)).
 See [`docs/plan/README.md`](docs/plan/README.md) for the milestones.
 
@@ -43,8 +45,7 @@ let stream = oxbrotli::compress(&text, 4);
 assert_eq!(oxbrotli::decompress(&stream).unwrap(), text);
 ```
 
-`compress_with` takes `Options`, for the window: `Options::new(4).lgwin(18)`. Every quality
-compresses as quality 4 does for now.
+`compress_with` takes `Options`, for the window: `Options::new(4).lgwin(18)`.
 
 For a body that arrives in pieces, `StreamCompressor` takes it chunk by chunk; `flush` makes
 everything so far decodable. The compressor keeps its memory from one stream to the next, and

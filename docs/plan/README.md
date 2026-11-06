@@ -26,9 +26,15 @@ qualities come after.
 | B7 Block splitting | Greedy block splitting and histogram tuning as the reference does at quality 4 | Ratio within 0.5% of `brotli -q 4` | Done 2026-11-06 |
 | B8 Streaming | `StreamCompressor`: write, flush (byte-aligned), finish, reset, size hint | Write, flush, finish and reuse, with every flushed prefix decodable | Done 2026-11-06 |
 | B9 Speed | Profiling-driven work on the hot loops; `benches/versus_brotli.rs`; `docs/benchmarks.md` | Faster than the `brotli` crate at q4 on web-sized bodies (1 KiB to 1 MiB) | Done 2026-11-06: as fast as the C reference (the crate comparison is the caller's, B10) |
+| B11 Quality levels | `Options::quality` chooses the encoder: 5 and 6 get their own, 0-4 compress as 4, 7-11 as 6 | Tests pin the mapping; quality 4 output unchanged | Done 2026-11-06 |
+| B12 Chain hashers | H5 and H6: buckets of the last 2^(q-1) positions; four last distances tried; two dictionary words per position | Ratio within 1% of `brotli -q 5` / `-q 6` at window 19, with one literal context | Done 2026-11-06: corpus -0.00% in total at both; real files +0.68% (q5), web bodies -0.12% |
+| B13 Forgetful chains | H40 for windows of 16 or less | Ratio within 1% of the reference at windows 10 and 15 | Not started |
+| B14 Context modeling | Literal contexts (UTF-8 mode): the choice of 1, 2 or 13 contexts, the context block splitter, context maps written in full | Ratio within 0.5% of `brotli -q 5` / `-q 6` at windows 10, 15 and 19 | Not started |
+| B15 Release | Speed and memory at 5 and 6 measured; docs; 0.2.0 | `docs/benchmarks.md` has quality 5 and 6 rows; gate passes | Not started |
 
 
-Later and not scheduled: the other quality levels (0-3, 5-11), a streaming decoder,
+Qualities 5 and 6 are B11 to B15 (planned 2026-11-06). Later and not scheduled: the other
+quality levels (0-3, 7-11), a streaming decoder,
 large-window Brotli (2^25 to 2^30, not part of RFC 7932) and shared dictionaries (RFC 9842).
 Each one needs a plan before it starts.
 
@@ -736,3 +742,270 @@ Small bodies, followed up after B9 (2026-11-06). HTML bodies of 1 to 16 KiB came
 64 KiB, at the window `for_size` picks: total +0.07%, worst HTML 1 KiB +1.68%, held to 2%),
 and the files in `bench-data/` as served (at the window `for_size` picks, held to 1%); the
 generated corpus stays at 0.5% at windows 10, 15 and 19.
+
+---
+
+## Qualities 5 and 6 (B11 to B15)
+
+Goal: `Options::quality` 5 and 6 compress as the reference does at those qualities: smaller
+than quality 4, and slower. The output of quality 4 doesn't change.
+
+**What the reference does at qualities 5 and 6** (google/brotli v1.2.1, `db24a98`, read
+2026-11-06; `reference/c/enc/`). Each work order confirms its part before writing code, as
+B6 did:
+
+- *Hasher* (`quality.h`, `ChooseHasher`). Three cases:
+
+  | case | hasher | buckets | per bucket | hashed bytes |
+  |---|---|---|---|---|
+  | `lgwin` 16 or less | H40 (`hash_forgetful_chain_inc.h`) | 2^15 chains in one bank of 2^16 nodes | up to 16 (q5) or 32 (q6) hops | 4 |
+  | size hint 1 MiB or more and `lgwin` 19 or more | H6 (`hash_longest_match64_inc.h`) | 2^15 | the last 2^(q-1) positions | 5 (of an 8-byte read) |
+  | otherwise | H5 (`hash_longest_match_inc.h`) | 2^14 | the last 2^(q-1) positions | 4 |
+
+  The defines in `hash.h` say how the reference builds it with SIMD (H58, H68); ignore those.
+- *Last distances* (all three): the four ring distances are tried first, with
+  `BackwardReferenceScoreUsingLastDistance` minus `BackwardReferencePenaltyUsingLastDistance(i)`
+  for i > 0. A length of 2 counts for the first two (H5, H6) or for all (H40); H40 checks
+  candidates 1 to 3 against a one-byte "tiny hash" of each position first. At quality 5 and 6
+  `num_last_distances_to_check` is 4, so `PrepareDistanceCache` adds nothing.
+- *Bucket search* (H5, H6): newest to oldest, stopping at the first that is too far. A candidate
+  must match the 4 bytes ending at the best length so far + 1 (at least 4). H6 also compares
+  the first 4 bytes. Then the position is filed: `bucket[num & mask] = pos; num += 1`.
+- *Static dictionary*: `SearchInStaticDictionary` with `shallow` false: **two** words per hash
+  key (`kStaticDictionaryHash[key]` and `[key + 1]`), each counted as a lookup.
+- *Lazy matching* (`backward_references_inc.h`): as at quality 4, but the second search starts
+  from length 0, not `best.len - 1` (`MIN_QUALITY_FOR_EXTENSIVE_REFERENCE_SEARCH`).
+- *Literal context modeling* (`encode.c`, `DecideOverLiteralContextModeling`, from quality 5,
+  meta-blocks of 64 bytes or more; context mode always UTF-8 below quality 10):
+  - If the size hint is 1 MiB or more, `ShouldUseComplexStaticContextMap` samples 64-byte
+    strides every 4 KiB. It uses the 13-context `kStaticContextMapComplexUTF8` if that saves
+    0.2 bits a byte or more and the entropy with contexts is at most 3 bits.
+  - Otherwise `ChooseContextMap` takes a bigram histogram of the bytes' top two bits (same
+    sampling). Below quality 7 the 3-context map is ruled out, so the choice is 1 context or
+    2 (`kStaticContextMapSimpleUTF8`), which needs a saving of 0.2 bits a byte.
+- *Block splitting* (`metablock.c`, `BrotliBuildMetaBlockGreedy` with `num_contexts` > 1): a
+  `ContextBlockSplitter` with a histogram per (type, context). It has the same sizes and
+  thresholds as quality 4, and at most 256 / `num_contexts` types. The literal context map is
+  then `type * num_contexts + static_map[context]` (`MapStaticContexts`).
+- *Writing* (`brotli_bit_stream.c`, `BrotliStoreMetaBlock`): a literal context map that isn't
+  trivial is written by `EncodeContextMap`: move-to-front, zero runs (`RunLengthCodeZeros`),
+  a prefix code for the result, and the IMTF bit set. Each literal is coded with the
+  histogram its type and context select.
+- Unchanged from quality 4: `lgblock` 16, meta-block sizes, histogram tuning
+  (`BrotliOptimizeHistograms`), distance parameters, the uncompressed fallback.
+
+Mapping of the other qualities (owner can change this; record the decision in B11): 0 to 4
+compress as 4, as now; 7 to 11 compress as 6 until they have their own plans.
+
+---
+
+## B11 Quality levels
+
+Goal: one switch from `Options::quality` to the encoder settings, so B12 to B14 each add a
+piece behind it.
+Depends on: B9.
+Files: `src/lib.rs`, `src/encode/mod.rs`, `src/encode/matcher.rs`, `src/encode/stream.rs`.
+
+Spec:
+- A crate-private `Level` enum (`Q4`, `Q5`, `Q6`) from `Options::quality`: 0-4 `Q4`, 5 `Q5`,
+  6-11 `Q6`. `StreamCompressor::set_options` takes the quality for the next stream as well
+  as the window.
+- `Encoder::new`/`reset` take the level. Until B12 lands, `Q5` and `Q6` run the quality 4
+  code, so this order changes no output.
+- Public docs: `Options::quality` says which qualities are implemented and what the others do.
+
+Tests:
+- The mapping, for every quality 0 to 11 and one past (12 clamps to 6).
+- Quality 4 output is byte-identical to before on the corpus (compare against
+  `compress(src, 4)` from before the change, saved by the test as a hash table in the test
+  file, or with a scratch copy of the previous commit, as the speed work did).
+- A reused `StreamCompressor` given quality 4, then 5, then 4 writes what fresh ones do.
+
+Done when: the gate passes and quality 4 output is unchanged.
+
+---
+
+## B12 Chain hashers (H5, H6)
+
+Goal: the matching of qualities 5 and 6 for windows of 17 or more.
+Depends on: B11.
+Read first: `c/enc/hash_longest_match_inc.h`, `c/enc/hash_longest_match64_inc.h`,
+`c/enc/hash.h` (`PrepareDistanceCache`, the score functions, `SearchInStaticDictionary`),
+`c/enc/backward_references_inc.h`.
+Files: `src/encode/chain.rs` (new), `src/encode/matcher.rs`, `src/encode/static_dict.rs`.
+
+Spec:
+- `chain::Hasher` with `num: Vec<u16>` (one count per bucket) and `buckets: Vec<u32>`
+  (2^`block_bits` positions per bucket), `bucket_bits` 14 (H5) or 15 (H6), `block_bits`
+  `quality - 1`, and the hash of 4 bytes (H5: `u32 * 0x1e35a7bd >> (32 - 14)`) or of 5 bytes
+  of an 8-byte read (H6: `(u64 << 24) * kHashMul64 >> (64 - 15)`). `store`, `store_range`
+  and `find_longest_match` as the reference does, in that order of checks.
+- The matcher calls one of the two hashers through an enum or a generic parameter, not a
+  trait object. **Measure** both against quality 4 to see which keeps quality 4 as fast as
+  it is now; it must not get slower by more than 1% (the B9 numbers).
+- Four last distances, scored with the penalty. The ring already holds the four.
+- The lazy search's second lookup starts from length 0 at quality 5 and 6.
+- Dictionary, two words per key: our table has one word per hash. Give it a second, by our
+  own rule (rule 9 still applies). Start with the second-shortest word of the hash, then try
+  the longest, and keep whichever is smaller on the corpus and on `bench-data/`. Record both
+  numbers here. Quality 4 keeps using the first word only.
+- Memory: the reference's tables are fixed: H5 1 MiB at quality 5 and 2 MiB at 6, H6 2 and
+  4 MiB, plus the counts. Do the same first. Then try sizing the bucket count from the size
+  hint, as H4 does; report the ratio change at 1 KiB to 64 KiB. Keep it only if the ratio
+  moves by less than 0.1%.
+
+Tests:
+- Unit: `store` then `find_longest_match` finds a planted repeat; a bucket that has wrapped
+  keeps only its newest 2^`block_bits` positions; a candidate past `max_backward` stops the
+  walk.
+- Round trip and `brotli -d` on the corpus at quality 5 and 6, windows 17 to 24.
+- `tests/ratio.rs` takes a quality: at 5 and 6, window 19 only for now (the smaller windows
+  need B13). Fail above 1% (B14 tightens it).
+
+Done when: the gate passes; at window 19 the ratio is within 1% of `brotli -q 5` and `-q 6`.
+Stop and ask if: the dictionary's second word can't get within 1% without the reference's
+table.
+
+Notes (2026-11-06):
+- *Calling the hashers.* A generic parameter: `Finder`, implemented by quality 4's `Hasher` and
+  by `chain::Chain`; `process` takes the level's hasher out of the encoder and runs the loop
+  monomorphized for it. Quality 4's output is byte-identical to 0.1.1's on the 90 files of
+  `bench-data/` and the reference's test data, at windows 10, 16, 19, 22 and 24, hinted and
+  not. Its speed, against 0.1.1 in the same binary, interleaved: -1.7% to +1.0% on small files,
+  +0.3% to +0.9% on the largest (a 1.1 MB script, a 470 KiB text). The second loop costs
+  code layout: with the chain path stubbed out the gap halves. Tried and dropped: copying
+  the ring per position (+1.0 to +1.8%), `#[inline(never)]` per hasher (+1.0 to +1.9%).
+- *The dictionary's second word.* The reference's table has two slots per hash: one for words
+  of 8 bytes or more, one for words of 4 to 7 (`c/enc/encoder_dict.c`,
+  `BuildDictionaryHashTable`, files words so; the static table adds the tuned bitmap). Three
+  rules measured at window 19, ours against the reference's (q5; q6 within 0.05% of each):
+
+  | second word | corpus | web bodies | `bench-data/` | worst real file |
+  |---|---|---|---|---|
+  | the next shortest of 8 bytes or more | +0.009% | +0.53% | +1.08% | +11.9% |
+  | the longest of 8 bytes or more | +0.008% | +0.57% | +1.09% | +11.9% |
+  | the shortest of 4 to 7 bytes (kept) | -0.001% | -0.12% | +0.68% | +1.4% |
+
+  Each slot holds the shortest, then the lowest-index word of its lengths, as quality 4's.
+- *Short inputs.* The corpus's 100-byte text comes out at 81 bytes against 77: the reference's
+  short-word slots differ from ours (the bitmap), and in 100 bytes one word is 4%. Its
+  quality 5 commands, traced through our decoder, make the same 2-byte copies from the last
+  distances as ours. `tests/ratio.rs` lets an output under 1 KiB be 4 bytes over the limit at
+  qualities 5 and 6 (owner's choice). The owner also confirmed the two-slot layout under
+  rule 9 (it is the reference's documented filing rule, not its data) and the level mapping
+  (0-4, 5, 6-11).
+- *Memory.* The reference-size tables first (H5 1 MiB at quality 5, 2 MiB at 6). Then sized
+  from the hint, at so many buckets per byte, against the fixed size, on the generated web
+  bodies and the files of `bench-data/` up to 64 KiB, at window 19 and at `for_size`'s:
+  a quarter per byte, up to +0.54% (a 16 KiB stylesheet); one per byte, at most +0.00%
+  (one group -0.04%); 4 and 16 per byte, identical. Kept: one per byte, at least 256 buckets.
+  A 1 KiB body's table at quality 5 is 64 KiB instead of 1 MiB.
+- *Interop.* Besides the tests (the corpus at qualities 4 to 6 and every window through our
+  decoder and `brotli -d`, streams in chunks and with flushes at 5 and 6), a scratch sweep:
+  the 90 files of `bench-data/` and the reference's test data, at qualities 4 to 6 and
+  windows 10 to 24, ours one-shot and streamed with flushes through `brotli -d`, and
+  `brotli -q -w` through ours: 12,150 checks, none failed.
+- *Mutations.* 17 tried. Killed by the tests: the penalty, length 2 from all four last
+  distances, the search not filing its position, the dictionary shallow or off, the short
+  slot off or short of 7-byte words, the bucket bits, H6 never chosen, H6's hash reading 6
+  bytes, the block-end stitch off, no rebase, quality 5 run as 6. Killed only by the ratio
+  test: the lazy search starting from the match in hand. Equivalent: a bucket match of 3
+  (the 4-byte check already rules it out where it could win), the walk going on past the
+  window (older positions are farther), rebase wrapping instead of saturating (a wrapped
+  position is past `cur`, out of reach).
+
+---
+
+## B13 Forgetful chains (H40)
+
+Goal: qualities 5 and 6 at windows of 16 or less: every small response compressed with
+`Options::for_size`.
+Depends on: B12.
+Read first: `c/enc/hash_forgetful_chain_inc.h`.
+Files: `src/encode/forgetful.rs` (new), `src/encode/matcher.rs`.
+
+Spec:
+- The reference's layout: `addr: [u32; 2^15]` (last position per chain, initialized to
+  `0xCCCCCCCC` so new chains end after one node), `head: [u16; 2^15]`, `tiny_hash: [u8; 2^16]`
+  (the low byte of each position's hash, indexed by the low 16 bits of the position), and one
+  bank of 2^16 nodes (`delta: u16`, `next: u16`), filled in a ring. `max_hops` is
+  `8 << (quality - 4)`: 16 at quality 5, 32 at 6.
+- Deltas over 65,535 are stored as 65,535 (`CAPPED_CHAINS` 0): the walk then reaches past the
+  window and stops.
+- The last-distance checks use the tiny hash for candidates 1 to 3 and accept a length of 2.
+- Memory: about 512 KiB per compressor, all reset per stream. Measure the reset at 1 KiB:
+  the reference clears only the `addr`/`head` entries the input touches for small one-shot
+  inputs (`partial_prepare_threshold`). Do the same in `reset` when the size hint is known
+  and small.
+
+Tests:
+- Unit: a chain longer than `max_hops` is cut; a delta over 65,535 ends the walk; the tiny
+  hash rejects a wrong last-distance candidate.
+- Round trip and `brotli -d` at quality 5 and 6, windows 10 to 16.
+- `tests/ratio.rs` at quality 5 and 6, windows 10 and 15, and the web-sized bodies. Fail
+  above 1%.
+
+Done when: the gate passes and the ratio is within 1% at windows 10 and 15.
+
+---
+
+## B14 Context modeling
+
+Goal: literal contexts, the rest of the ratio gap.
+Depends on: B12 (B13 helps measure it at small windows, but isn't required).
+Read first: `c/enc/encode.c` (`DecideOverLiteralContextModeling`, `ChooseContextMap`,
+`ShouldUseComplexStaticContextMap`, `WriteMetaBlockInternal`), `c/enc/metablock.c`
+(`ContextBlockSplitter*`, `MapStaticContexts`, `BrotliBuildMetaBlockGreedyInternal`),
+`c/enc/brotli_bit_stream.c` (`EncodeContextMap`, `MoveToFrontTransform`,
+`RunLengthCodeZeros`, `BrotliStoreMetaBlock`), RFC §7.
+Files: `src/encode/context.rs` (new: the decision and the static maps), `src/encode/
+metablock.rs`, `src/encode/mod.rs`, `src/context.rs` (reuse the decoder's UTF-8 lookup;
+don't copy it).
+
+Spec:
+- The decision, per meta-block, as listed above. The three static maps are context data
+  from the reference's encoder, not from the RFC: write them from the reference's comments
+  (special, lf, space, punctuation, digits, upper, lower), and check each entry in a test
+  that says why it has that value.
+- The context block splitter: one histogram per (type, context). Per context, the same
+  entropy comparisons as the plain splitter, summed over contexts. At most
+  256 / `num_contexts` types.
+- The context map writer, `EncodeContextMap`: move-to-front, zero runs with the largest run
+  prefix that helps (at most 6), the prefix code, IMTF on. With one context it still writes
+  the trivial map as now.
+- Writing literals: each literal's code is chosen by `context_map[type << 6 | context]`.
+  `context` comes from the two bytes before it, including across commands (copies too) and
+  from the previous meta-block (the reference passes `prev_byte` and `prev_byte2`).
+- Quality 4 stays with one context and unchanged output.
+
+Tests:
+- Unit: the context map writer round-trips through the decoder's reader for maps of 1 to 256
+  clusters, with and without long zero runs; the decision picks 1 context for random bytes
+  and 2 for UTF-8 text with many two-byte letters.
+- Round trip and `brotli -d` at quality 5 and 6 on the corpus, windows 10 to 24, one shot and
+  streamed with flushes (the context of a meta-block's first literals comes from before the
+  flush).
+- `tests/ratio.rs`: quality 5 and 6 at windows 10, 15 and 19, limit 0.5%; web-sized bodies
+  2%; `bench-data/` 1%.
+
+Done when: the gate passes and the ratio tests pass at those limits.
+Stop and ask if: 0.5% isn't reachable; report the gap per entry and what it comes from.
+
+---
+
+## B15 Release
+
+Goal: qualities 5 and 6 documented and measured, then released.
+Depends on: B14.
+Files: `docs/benchmarks.md`, `README.md`, `src/lib.rs`, `Cargo.toml`, `benches/versus_brotli.rs`.
+
+Spec:
+- `benches/versus_brotli.rs` runs qualities 4, 5 and 6; `docs/benchmarks.md` gets their size
+  and speed against the reference, and memory per compressor.
+- Profile quality 5 and 6 the way B9 did. They should run within 10% of the reference's
+  speed. If not, stop and report.
+- README and crate docs: which qualities are implemented, and what the others do.
+- Version 0.2.0 (the meaning of `Options::quality` changed), tag and release when the owner
+  says so.
+
+Done when: the gate passes and the owner has the numbers.

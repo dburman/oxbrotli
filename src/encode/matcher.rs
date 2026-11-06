@@ -13,9 +13,10 @@
 //!   bytes, or its commands or literals reach an eighth of that.
 
 use crate::bitwriter::BitWriter;
+use crate::encode::chain::{self, Chain};
 use crate::encode::command::{Command, DistanceCode, Ring};
-use crate::encode::hash::{H4, H54, HASH_READ, Hasher, MIN_SCORE, Match, Params, match_length};
-use crate::encode::{MAX_MLEN, write_empty_last, write_meta_block, write_window};
+use crate::encode::hash::{Finder, H4, H54, Hasher, MIN_SCORE, Match, Params, match_length};
+use crate::encode::{Level, MAX_MLEN, write_empty_last, write_meta_block, write_window};
 
 /// The input block (`lgblock` 16 at quality 4).
 pub(crate) const INPUT_BLOCK: usize = 1 << 16;
@@ -34,7 +35,12 @@ const LARGE_INPUT: usize = 1 << 20;
 
 /// The state of one stream being compressed.
 pub(crate) struct Encoder {
+    /// What the quality selects: the hasher, so far.
+    level: Level,
+    /// Quality 4's hasher.
     hasher: Hasher,
+    /// The hasher of qualities 5 and 6 (empty at quality 4).
+    chain: Chain,
     ring: Ring,
     /// The ring as the last meta-block left it: an uncompressed meta-block goes back to it.
     saved_ring: Ring,
@@ -51,23 +57,28 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    /// An encoder for a stream of about `size_hint` bytes, if known, with window `lgwin`.
-    pub(crate) fn new(size_hint: Option<usize>, lgwin: u32) -> Self {
-        Self {
-            hasher: Hasher::new(Self::params(size_hint), size_hint),
+    /// An encoder for a stream of about `size_hint` bytes, if known, with window `lgwin`, at
+    /// `level`.
+    pub(crate) fn new(size_hint: Option<usize>, lgwin: u32, level: Level) -> Self {
+        let mut e = Self {
+            level,
+            hasher: Hasher::default(),
+            chain: Chain::default(),
             ring: Ring::START,
             saved_ring: Ring::START,
-            max_backward: (1 << lgwin) - WINDOW_GAP,
+            max_backward: 0,
             flushed: 0,
             commands: Vec::new(),
             literals: Vec::new(),
             pending: 0,
             last_is_dictionary: false,
-        }
+        };
+        e.reset(size_hint, lgwin, level);
+        e
     }
 
-    /// The hasher for a stream of `size_hint` bytes: H54 for large ones, as the reference
-    /// picks given the size.
+    /// Quality 4's hasher for a stream of `size_hint` bytes: H54 for large ones, as the
+    /// reference picks given the size.
     fn params(size_hint: Option<usize>) -> Params {
         if size_hint.is_some_and(|n| n >= LARGE_INPUT) {
             H54
@@ -76,9 +87,34 @@ impl Encoder {
         }
     }
 
+    /// The chain hasher at `level` for a stream of `size_hint` bytes with window `lgwin`
+    /// (`ChooseHasher`): H6 for 1 MiB or more at windows of 19 or more, otherwise H5.
+    fn chain_params(level: Level, size_hint: Option<usize>, lgwin: u32) -> chain::Params {
+        let quality = if level == Level::Q5 { 5 } else { 6 };
+        if size_hint.is_some_and(|n| n >= LARGE_INPUT) && lgwin >= 19 {
+            chain::Params {
+                bucket_bits: 15,
+                block_bits: quality - 1,
+                wide: true,
+            }
+        } else {
+            chain::Params {
+                bucket_bits: 14,
+                block_bits: quality - 1,
+                wide: false,
+            }
+        }
+    }
+
     /// Ready for a new stream, as [`new`](Self::new) would make it, keeping its memory.
-    pub(crate) fn reset(&mut self, size_hint: Option<usize>, lgwin: u32) {
-        self.hasher.reset(Self::params(size_hint), size_hint);
+    pub(crate) fn reset(&mut self, size_hint: Option<usize>, lgwin: u32, level: Level) {
+        self.level = level;
+        if level == Level::Q4 {
+            self.hasher.reset(Self::params(size_hint), size_hint);
+        } else {
+            self.chain
+                .reset(Self::chain_params(level, size_hint, lgwin), size_hint);
+        }
         self.ring = Ring::START;
         self.saved_ring = Ring::START;
         self.max_backward = (1 << lgwin) - WINDOW_GAP;
@@ -115,12 +151,14 @@ impl Encoder {
     pub(crate) fn rebase(&mut self, by: usize) {
         debug_assert!(by <= self.flushed);
         self.hasher.rebase(by);
+        self.chain.rebase(by);
         self.flushed -= by;
     }
 
     /// Bytes held between streams.
     pub(crate) fn capacity_bytes(&self) -> usize {
         self.hasher.capacity_bytes()
+            + self.chain.capacity_bytes()
             + self.commands.capacity() * size_of::<Command>()
             + self.literals.capacity()
     }
@@ -130,6 +168,7 @@ impl Encoder {
     #[cfg(test)]
     pub(crate) fn footprint(&self) -> usize {
         self.hasher.table_bytes()
+            + self.chain.capacity_bytes()
             + self.commands.capacity() * size_of::<Command>()
             + self.literals.capacity()
             + self.commands.len() * size_of::<crate::encode::command::Coded>()
@@ -138,11 +177,26 @@ impl Encoder {
 
     /// Finds the commands for `src[start..end]`, one input block.
     pub(crate) fn process(&mut self, src: &[u8], start: usize, end: usize) {
+        // The hasher comes out of `self` for the loop, so the loop can borrow the rest.
+        if self.level == Level::Q4 {
+            let mut f = std::mem::take(&mut self.hasher);
+            self.process_with(&mut f, src, start, end);
+            self.hasher = f;
+        } else {
+            let mut f = std::mem::take(&mut self.chain);
+            self.process_with(&mut f, src, start, end);
+            self.chain = f;
+        }
+    }
+
+    /// [`process`](Self::process) with the match finder `f`.
+    #[inline(always)]
+    fn process_with<F: Finder>(&mut self, f: &mut F, src: &[u8], start: usize, end: usize) {
         let mut position = start;
         // The last three positions of the block before couldn't be hashed then: their bytes
         // ran into this block.
-        if end - start >= HASH_READ - 1 && start >= 3 {
-            self.hasher.store_range(src, start - 3..start);
+        if end - start >= f.hash_len() - 1 && start >= 3 {
+            f.store_range(src, start - 3..start);
         }
         if let Some(last) = self.commands.last_mut()
             && self.pending == 0
@@ -160,24 +214,25 @@ impl Encoder {
                 last.copy += (position - start) as u32;
             }
         }
-        self.find_commands(src, position, end);
+        self.find_commands(f, src, position, end);
     }
 
     /// The match loop over `src[position..end]`.
-    fn find_commands(&mut self, src: &[u8], mut position: usize, end: usize) {
-        let store_end = if end - position >= HASH_READ {
-            end - HASH_READ + 1
+    #[inline(always)]
+    fn find_commands<F: Finder>(&mut self, f: &mut F, src: &[u8], mut position: usize, end: usize) {
+        let hash_len = f.hash_len();
+        let store_end = if end - position >= hash_len {
+            end - hash_len + 1
         } else {
             position
         };
         let mut sparse_from = position + SPARSE_AFTER;
-        while position + HASH_READ < end {
+        while position + hash_len < end {
             let mut max_length = end - position;
             let mut best = Match::none(0);
-            let last = self.ring.last() as usize;
-            self.hasher.find_longest_match(
+            f.find_longest_match(
                 src,
-                last,
+                &self.ring,
                 position,
                 max_length,
                 position.min(self.max_backward),
@@ -189,14 +244,14 @@ impl Encoder {
                 position += 1;
                 if position > sparse_from {
                     // Long without a match: try fewer positions, and file fewer.
-                    let (step, reach) = if position > sparse_from + 4 * SPARSE_AFTER {
-                        (4, 16)
+                    let (step, reach, margin) = if position > sparse_from + 4 * SPARSE_AFTER {
+                        (4, 16, (hash_len - 1).max(4))
                     } else {
-                        (2, 8)
+                        (2, 8, (hash_len - 1).max(2))
                     };
-                    let jump = (position + reach).min(end - (HASH_READ - 1));
+                    let jump = (position + reach).min(end - margin);
                     while position < jump {
-                        self.hasher.store(src, position);
+                        f.store(src, position);
                         position += step;
                         self.pending += step;
                     }
@@ -207,10 +262,14 @@ impl Encoder {
             let mut delays = 0;
             loop {
                 max_length -= 1;
-                let mut later = Match::none((best.len - 1).min(max_length));
-                self.hasher.find_longest_match(
+                let mut later = Match::none(if F::FRESH_LAZY {
+                    0
+                } else {
+                    (best.len - 1).min(max_length)
+                });
+                f.find_longest_match(
                     src,
-                    last,
+                    &self.ring,
                     position + 1,
                     max_length,
                     (position + 1).min(self.max_backward),
@@ -223,7 +282,7 @@ impl Encoder {
                 self.pending += 1;
                 best = later;
                 delays += 1;
-                if delays == MAX_DELAYS || position + HASH_READ >= end {
+                if delays == MAX_DELAYS || position + hash_len >= end {
                     break;
                 }
             }
@@ -238,7 +297,7 @@ impl Encoder {
                     .max(position + best.len - (best.distance << 2))
                     .min(store_stop);
             }
-            self.hasher.store_range(src, store_start..store_stop);
+            f.store_range(src, store_start..store_stop);
             position += best.len;
         }
         self.pending += end - position;
@@ -299,8 +358,8 @@ pub(crate) fn max_meta_block(lgwin: u32) -> usize {
     (1 << (1 + lgwin.max(16))).min(MAX_MLEN)
 }
 
-/// Compresses `src` into `out` at quality 4 with window `lgwin`.
-pub(crate) fn compress(src: &[u8], lgwin: u32, out: &mut Vec<u8>) {
+/// Compresses `src` into `out` at `level` with window `lgwin`.
+pub(crate) fn compress(src: &[u8], lgwin: u32, level: Level, out: &mut Vec<u8>) {
     let mut w = BitWriter::new(out);
     write_window(&mut w, lgwin);
     if src.is_empty() {
@@ -308,7 +367,7 @@ pub(crate) fn compress(src: &[u8], lgwin: u32, out: &mut Vec<u8>) {
         w.finish();
         return;
     }
-    let mut e = Encoder::new(Some(src.len()), lgwin);
+    let mut e = Encoder::new(Some(src.len()), lgwin, level);
     let max_block = max_meta_block(lgwin);
     let mut start = 0;
     while start < src.len() {
@@ -328,7 +387,7 @@ mod tests {
     use super::{Encoder, compress};
     use crate::bitwriter::BitWriter;
     use crate::encode::command::{DistanceCode, Ring};
-    use crate::encode::write_window;
+    use crate::encode::{Level, write_window};
 
     fn noise(len: usize, seed: u32) -> Vec<u8> {
         let mut x = seed;
@@ -344,7 +403,7 @@ mod tests {
 
     fn round_trip(src: &[u8], lgwin: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        compress(src, lgwin, &mut out);
+        compress(src, lgwin, Level::Q4, &mut out);
         assert!(
             crate::decompress(&out).unwrap() == src,
             "{} bytes, lgwin {lgwin}",
@@ -358,7 +417,7 @@ mod tests {
     fn planted(distance: usize) -> Vec<DistanceCode> {
         let mut src = noise(3000, 9);
         src.copy_within(200..264, 200 + distance);
-        let mut e = Encoder::new(Some(src.len()), 10);
+        let mut e = Encoder::new(Some(src.len()), 10, Level::Q4);
         e.process(&src, 0, src.len());
         round_trip(&src, 10);
         e.commands.iter().map(|c| c.distance).collect()
@@ -394,7 +453,7 @@ mod tests {
     fn copies_run_on_across_input_blocks() {
         // One long run: the copy that ends at the first input block's end goes on.
         let src = vec![b'a'; 300_000];
-        let mut e = Encoder::new(Some(src.len()), 22);
+        let mut e = Encoder::new(Some(src.len()), 22, Level::Q4);
         e.process(&src, 0, 1 << 16);
         let before = e.commands.len();
         e.process(&src, 1 << 16, 2 << 16);
@@ -439,7 +498,7 @@ mod tests {
         let mut out = Vec::new();
         let mut w = BitWriter::new(&mut out);
         write_window(&mut w, 16);
-        let mut e = Encoder::new(Some(src.len()), 16);
+        let mut e = Encoder::new(Some(src.len()), 16, Level::Q4);
         e.process(&src, 0, stored.len());
         e.ring.push(777);
         e.flush(&mut w, &src, stored.len(), false);
@@ -499,7 +558,7 @@ mod tests {
                 t.truncate(len);
                 t
             };
-            let mut e = Encoder::new(Some(src.len()), lgwin);
+            let mut e = Encoder::new(Some(src.len()), lgwin, Level::Q4);
             let mut peak = 0;
             let mut start = 0;
             while start < src.len() {
@@ -509,7 +568,7 @@ mod tests {
                 start = end;
             }
             let mut out = Vec::new();
-            compress(&src, lgwin, &mut out);
+            compress(&src, lgwin, Level::Q4, &mut out);
             println!(
                 "{kind} {len} bytes, lgwin {lgwin}: {} KiB (table {} KiB), output {} bytes",
                 (peak + out.capacity()) / 1024,
@@ -520,10 +579,57 @@ mod tests {
     }
 
     #[test]
+    fn the_chain_hasher_follows_the_quality_size_and_window() {
+        use crate::encode::chain::Params;
+        let p = |level, hint, lgwin| {
+            let Params {
+                bucket_bits,
+                block_bits,
+                wide,
+            } = Encoder::chain_params(level, hint, lgwin);
+            (bucket_bits, block_bits, wide)
+        };
+        let mib = Some(1 << 20);
+        assert_eq!(p(Level::Q5, Some(1000), 22), (14, 4, false));
+        assert_eq!(p(Level::Q6, Some(1000), 22), (14, 5, false));
+        assert_eq!(p(Level::Q6, None, 22), (14, 5, false));
+        assert_eq!(p(Level::Q5, mib, 19), (15, 4, true));
+        assert_eq!(p(Level::Q6, mib, 24), (15, 5, true));
+        assert_eq!(p(Level::Q6, mib, 18), (14, 5, false));
+        assert_eq!(p(Level::Q6, Some((1 << 20) - 1), 19), (14, 5, false));
+    }
+
+    #[test]
+    fn a_repeat_of_an_input_blocks_last_bytes_is_found() {
+        // The last 3 positions of a block are filed when the next block comes: a repeat of
+        // 16 bytes starting at the first block's third-last byte is copied whole. (Soon after
+        // the block starts: 64 literals on, positions are skipped.)
+        let mut src = noise(80_000, 23);
+        let from = (1 << 16) - 3;
+        let to = (1 << 16) + 30;
+        src.copy_within(from..from + 16, to);
+        for level in [Level::Q5, Level::Q6] {
+            let mut e = Encoder::new(Some(src.len()), 22, level);
+            e.process(&src, 0, 1 << 16);
+            e.process(&src, 1 << 16, src.len());
+            let mut at = 0;
+            let found = e.commands.iter().any(|c| {
+                at += c.insert as usize;
+                let hit = at == to
+                    && c.copy == 16
+                    && c.distance == DistanceCode::explicit((to - from) as u32);
+                at += c.copy as usize;
+                hit
+            });
+            assert!(found, "{level:?}");
+        }
+    }
+
+    #[test]
     fn dictionary_words_are_used() {
         // Words of 8 or more letters with nothing earlier to copy from.
         let src = b"information international environment ";
-        let mut e = Encoder::new(Some(src.len()), 22);
+        let mut e = Encoder::new(Some(src.len()), 22, Level::Q4);
         e.process(src, 0, src.len());
         assert!(e.last_is_dictionary || e.commands.iter().any(|c| c.distance.code >= 16));
         round_trip(src, 22);

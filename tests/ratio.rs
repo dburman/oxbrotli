@@ -1,4 +1,4 @@
-//! Our size against `brotli -q 4`'s, per corpus entry and window. Run by `scripts/gate --ratio`
+//! Our size against the reference `brotli`'s, per quality, corpus entry and window. Run by `scripts/gate --ratio`
 //! (or `cargo test --release --test ratio -- --ignored --nocapture`): it prints the table, and
 //! fails if any entry comes out more than [`LIMIT`] larger than the reference's.
 
@@ -11,6 +11,8 @@
 
 mod common;
 
+use std::fmt::Write as _;
+
 use common::{brotli_file, corpus};
 
 /// How much larger than the reference's an output may be: 0.5%.
@@ -19,11 +21,44 @@ const LIMIT: f64 = 1.005;
 /// A corpus entry's name and length, and per window our size and the reference's.
 type Row = (String, usize, Vec<(usize, usize)>);
 
+/// How much larger than the reference's an output of quality 5 or 6 may be, for now: 1%.
+/// Those qualities choose a context map for the literals, which we don't yet (B14).
+const CHAIN_LIMIT: f64 = 1.01;
+/// Bytes an output under 1 KiB may be over the limit: in 100 bytes one dictionary word is 4%,
+/// and from quality 5 the reference's tuned choice of short words decides (see B12 in
+/// `docs/plan/README.md`).
+const SMALL_SLACK: usize = 4;
+
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn quality_4_is_within_the_limit_of_the_reference() {
+    let (report, over) = corpus_within(4, &[10, 15, 19], LIMIT, 0);
+    println!("{report}");
+    assert!(over.is_empty(), "over the limit: {over:?}");
+}
+
+#[test]
+#[ignore = "slow; run by scripts/gate --ratio"]
+fn quality_5_is_within_the_limit_of_the_reference() {
+    // Windows of 16 or less use another hasher (B13).
+    let (report, over) = corpus_within(5, &[19], CHAIN_LIMIT, SMALL_SLACK);
+    println!("{report}");
+    assert!(over.is_empty(), "over the limit: {over:?}");
+}
+
+#[test]
+#[ignore = "slow; run by scripts/gate --ratio"]
+fn quality_6_is_within_the_limit_of_the_reference() {
+    let (report, over) = corpus_within(6, &[19], CHAIN_LIMIT, SMALL_SLACK);
+    println!("{report}");
+    assert!(over.is_empty(), "over the limit: {over:?}");
+}
+
+/// The generated corpus's sizes at `quality` and each of `windows`, ours against the
+/// reference's, as a table; and the entries more than `limit` times the reference's (plus
+/// `slack` bytes, for outputs under 1 KiB).
+fn corpus_within(quality: u32, windows: &[u32], limit: f64, slack: usize) -> (String, Vec<String>) {
     let corpus = corpus();
-    let windows = [10, 15, 19];
     let rows: Vec<Row> = std::thread::scope(|s| {
         let handles: Vec<_> = corpus
             .iter()
@@ -34,10 +69,12 @@ fn quality_4_is_within_the_limit_of_the_reference() {
                     let sizes = windows
                         .iter()
                         .map(|&w| {
-                            let ours =
-                                oxbrotli::compress_with(data, oxbrotli::Options::new(4).lgwin(w));
+                            let ours = oxbrotli::compress_with(
+                                data,
+                                oxbrotli::Options::new(quality).lgwin(w),
+                            );
                             assert!(oxbrotli::decompress(&ours).unwrap() == *data, "{name}");
-                            (ours.len(), brotli_file(data, 4, w).len())
+                            (ours.len(), brotli_file(data, quality, w).len())
                         })
                         .collect();
                     (name.clone(), data.len(), sizes)
@@ -46,44 +83,40 @@ fn quality_4_is_within_the_limit_of_the_reference() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    println!(
-        "{:<24} {:>10} {:>24} {:>24} {:>24}",
-        "entry", "bytes", "w10 ours/ref", "w15 ours/ref", "w19 ours/ref"
-    );
+    let mut report = format!("q{quality} {:<21} {:>10}", "entry", "bytes");
+    for w in windows {
+        write!(report, " {:>24}", format!("w{w} ours/ref")).unwrap();
+    }
     let mut worst = (0.0f64, String::new());
+    let mut over = Vec::new();
     for (name, len, sizes) in &rows {
-        let cells: Vec<String> = sizes
-            .iter()
-            .zip(windows)
-            .map(|(&(ours, theirs), w)| {
-                let ratio = ours as f64 / theirs as f64;
-                if ratio > worst.0 {
-                    worst = (ratio, format!("{name} w{w}"));
-                }
-                format!("{ours}/{theirs} {:+.2}%", (ratio - 1.0) * 100.0)
-            })
-            .collect();
-        println!(
-            "{name:<24} {len:>10} {:>24} {:>24} {:>24}",
-            cells[0], cells[1], cells[2]
-        );
+        write!(report, "\n{name:<24} {len:>10}").unwrap();
+        for (&(ours, theirs), w) in sizes.iter().zip(windows) {
+            let ratio = ours as f64 / theirs as f64;
+            if ratio > worst.0 {
+                worst = (ratio, format!("{name} w{w}"));
+            }
+            let allowed = if theirs < 1024 { slack } else { 0 };
+            if ours as f64 > theirs as f64 * limit + allowed as f64 {
+                over.push(format!("{name} w{w} {:+.2}%", (ratio - 1.0) * 100.0));
+            }
+            let cell = format!("{ours}/{theirs} {:+.2}%", (ratio - 1.0) * 100.0);
+            write!(report, " {cell:>24}").unwrap();
+        }
     }
     let (ours, theirs) = rows
         .iter()
         .flat_map(|r| &r.2)
         .fold((0, 0), |(a, b), &(x, y)| (a + x, b + y));
-    println!(
-        "total: {ours}/{theirs} {:+.2}%; worst {} {:+.2}%",
+    write!(
+        report,
+        "\ntotal: {ours}/{theirs} {:+.2}%; worst {} {:+.2}%",
         (ours as f64 / theirs as f64 - 1.0) * 100.0,
         worst.1,
         (worst.0 - 1.0) * 100.0
-    );
-    assert!(
-        worst.0 <= LIMIT,
-        "{} is {:+.2}% larger",
-        worst.1,
-        (worst.0 - 1.0) * 100.0
-    );
+    )
+    .unwrap();
+    (report, over)
 }
 
 /// How much larger than the reference's a web-sized body may be, for now: our dictionary

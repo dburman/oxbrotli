@@ -1,6 +1,7 @@
 //! The encoder: commands into meta-blocks (RFC 7932 §9), and the stream around them. The
 //! match finder is in [`matcher`].
 
+pub(crate) mod chain;
 pub(crate) mod command;
 pub(crate) mod hash;
 pub(crate) mod histogram;
@@ -30,6 +31,26 @@ pub(crate) const MAX_MLEN: usize = 1 << 24;
 /// Window sizes of RFC 7932 (§9.1).
 pub(crate) const MIN_LGWIN: u32 = 10;
 pub(crate) const MAX_LGWIN: u32 = 24;
+
+/// The encoder a quality selects. Qualities 0 to 4 compress as 4, and 7 to 11 as 6, until
+/// they have encoders of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Level {
+    Q4,
+    Q5,
+    Q6,
+}
+
+impl Level {
+    /// The level for `quality` (0 to 11; higher clamps to 11).
+    pub(crate) fn from_quality(quality: u32) -> Self {
+        match quality {
+            0..=4 => Self::Q4,
+            5 => Self::Q5,
+            _ => Self::Q6,
+        }
+    }
+}
 
 /// Writes the stream header for window size `lgwin` (§9.1).
 pub(crate) fn write_window(w: &mut BitWriter<'_>, lgwin: u32) {
@@ -438,11 +459,22 @@ pub(crate) fn write_meta_block(
 mod tests {
     use super::command::DistanceCode;
     use super::matcher::compress;
-    use super::{Command, write_meta_block, write_window};
+    use super::{Command, Level, write_meta_block, write_window};
     use crate::bitwriter::BitWriter;
 
     fn decompress(stream: &[u8]) -> Vec<u8> {
         crate::decompress(stream).unwrap()
+    }
+
+    #[test]
+    fn levels_follow_the_quality() {
+        for quality in 0..=4 {
+            assert_eq!(Level::from_quality(quality), Level::Q4, "quality {quality}");
+        }
+        assert_eq!(Level::from_quality(5), Level::Q5);
+        for quality in [6, 7, 9, 11, 12, u32::MAX] {
+            assert_eq!(Level::from_quality(quality), Level::Q6, "quality {quality}");
+        }
     }
 
     #[test]
@@ -462,7 +494,7 @@ mod tests {
     fn every_window_size_is_read_back() {
         for lgwin in 10..=24 {
             let mut out = Vec::new();
-            compress(b"window", lgwin, &mut out);
+            compress(b"window", lgwin, Level::Q4, &mut out);
             assert_eq!(decompress(&out), b"window", "lgwin {lgwin}");
             // The header alone, then an empty last meta-block.
             let mut header = Vec::new();
@@ -477,7 +509,7 @@ mod tests {
     #[test]
     fn the_empty_stream_is_one_byte() {
         let mut out = Vec::new();
-        compress(b"", 16, &mut out);
+        compress(b"", 16, Level::Q4, &mut out);
         assert_eq!(out, [0x06]);
         assert_eq!(decompress(&out), b"");
     }
@@ -585,7 +617,7 @@ mod tests {
         let text = b"the quick brown fox jumps over the lazy dog. ".repeat(4000);
         for len in [1, 2, 100, 65_535, 65_536, 65_537, text.len()] {
             let mut out = Vec::new();
-            compress(&text[..len], 22, &mut out);
+            compress(&text[..len], 22, Level::Q4, &mut out);
             assert_eq!(decompress(&out), &text[..len], "{len} bytes");
             if len > 1000 {
                 assert!(out.len() < len * 3 / 4, "{len} bytes: {}", out.len());
