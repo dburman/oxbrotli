@@ -28,7 +28,10 @@ const POSITION_ALIGN: usize = 32;
 
 /// The state of a stream compressor.
 pub(crate) struct Stream {
+    /// The window of the stream under way.
     lgwin: u32,
+    /// The window for the next stream.
+    next_lgwin: u32,
     size_hint: Option<usize>,
     encoder: Encoder,
     /// The window and the input not yet written: `buffer[processed..]` is the start of the
@@ -45,6 +48,7 @@ impl Stream {
     pub(crate) fn new(lgwin: u32, size_hint: Option<usize>) -> Self {
         Self {
             lgwin,
+            next_lgwin: lgwin,
             size_hint,
             // The smallest table: the stream's own is made at its first call.
             encoder: Encoder::new(Some(0), lgwin),
@@ -60,6 +64,11 @@ impl Stream {
         self.size_hint = size_hint;
     }
 
+    /// The window for the next stream.
+    pub(crate) fn set_lgwin(&mut self, lgwin: u32) {
+        self.next_lgwin = lgwin;
+    }
+
     /// Drops the stream under way, if any.
     pub(crate) fn reset(&mut self) {
         self.running = false;
@@ -70,6 +79,7 @@ impl Stream {
         if self.running {
             return;
         }
+        self.lgwin = self.next_lgwin;
         self.encoder.reset(self.size_hint, self.lgwin);
         self.buffer.clear();
         // Room for the stream hinted, up to what the buffer ever holds.

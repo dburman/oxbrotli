@@ -34,6 +34,8 @@ pub(crate) const H54: Params = Params {
 /// Slots per hash, eight apart.
 const SWEEP: usize = 4;
 const SWEEP_MASK: usize = (SWEEP - 1) << 3;
+/// The hash multiplier (the reference's `kHashMul64`).
+const HASH_MUL: u64 = 0x1fe3_5a7b_d357_9bd3;
 /// Bytes a hash reads.
 pub(crate) const HASH_READ: usize = 8;
 /// A hinted table has `2^SLOTS_PER_BYTE_BITS` slots per byte of the hint (up to the
@@ -135,8 +137,9 @@ impl Hasher {
     /// memory.
     pub(crate) fn reset(&mut self, params: Params, size_hint: Option<usize>) {
         let bits = size_hint.map_or(params.bucket_bits, |n| {
-            let wanted = n.max(1).next_power_of_two().ilog2() + SLOTS_PER_BYTE_BITS;
-            wanted.clamp(MIN_BUCKET_BITS, params.bucket_bits)
+            // ceil(log2(n)), without the overflow of next_power_of_two near usize::MAX.
+            let log = usize::BITS - (n.max(1) - 1).leading_zeros();
+            (log + SLOTS_PER_BYTE_BITS).clamp(MIN_BUCKET_BITS, params.bucket_bits)
         });
         self.buckets.clear();
         self.buckets.resize(1 << bits, 0);
@@ -170,8 +173,15 @@ impl Hasher {
     #[inline]
     fn hash(&self, data: &[u8], pos: usize) -> usize {
         let b = &data[pos..pos + HASH_READ];
-        let v = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-        ((v << self.shift).wrapping_mul(0x1fe3_5a7b_d357_9bd3) >> self.take) as usize
+        self.hash_word(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// The hash of the first bytes of `v` (little-endian): only the low `hash_len` count.
+    #[inline]
+    fn hash_word(&self, v: u64) -> usize {
+        ((v << self.shift).wrapping_mul(HASH_MUL) >> self.take) as usize
     }
 
     /// Files position `pos` (with [`HASH_READ`] bytes after it) under its hash.
@@ -181,15 +191,50 @@ impl Hasher {
         self.buckets[key & self.mask] = pos as u32;
     }
 
+    /// Files every position in `range`, in order, as [`store`](Self::store) would one by one.
+    /// Four at a time while 16 bytes can be read: their words come from two reads, which on
+    /// highly repetitive input (long copies, every position filed) took 40% of the time when
+    /// each position read its own.
     pub(crate) fn store_range(&mut self, data: &[u8], range: std::ops::Range<usize>) {
-        for pos in range {
-            self.store(data, pos);
+        // The parameters in locals and the table cut to the mask (it is exactly that long):
+        // otherwise each store could change them, as far as the compiler knows, and they would
+        // be read again and the index checked against the length every time.
+        let (shift, take, mask) = (self.shift, self.take, self.mask);
+        let Some(buckets) = self.buckets.get_mut(..=mask) else {
+            return;
+        };
+        let hash = |v: u64| ((v << shift).wrapping_mul(HASH_MUL) >> take) as usize;
+        let mut pos = range.start;
+        while pos + 4 <= range.end
+            && let Some(bytes) = data.get(pos..pos + 16)
+        {
+            let (lo, hi) = bytes.split_at(8);
+            let lo = u64::from_le_bytes(lo.try_into().unwrap_or_default());
+            let hi = u64::from_le_bytes(hi.try_into().unwrap_or_default());
+            for k in 0..4 {
+                // The word at pos + k: lo shifted down k bytes, the gap filled from hi.
+                let word = if k == 0 {
+                    lo
+                } else {
+                    (lo >> (8 * k)) | (hi << (64 - 8 * k))
+                };
+                let at = pos + k;
+                buckets[(hash(word) + (at & SWEEP_MASK)) & mask] = at as u32;
+            }
+            pos += 4;
+        }
+        for at in pos..range.end {
+            let b = &data[at..at + HASH_READ];
+            let word = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            buckets[(hash(word) + (at & SWEEP_MASK)) & mask] = at as u32;
         }
     }
 
     /// The best match for `data[cur..]` up to `max_length` bytes and `max_backward` back,
     /// trying `last` (the last distance) first, into `best` if it beats it; then files `cur`.
-    /// With nothing found, the dictionary is tried.
+    /// With nothing found, the dictionary is tried. Always inlined: out of line it cost 4% on a
+    /// 1 MiB script, where most positions are searched.
+    #[inline(always)]
     pub(crate) fn find_longest_match(
         &mut self,
         data: &[u8],
@@ -201,6 +246,10 @@ impl Hasher {
     ) {
         let start_score = best.score;
         let key = self.hash(data, cur);
+        // The slots first: on a large table they are the slow reads, and this way they are
+        // under way while the last distance is tried.
+        let prevs: [u32; SWEEP] =
+            std::array::from_fn(|i| self.buckets[(key + (i << 3)) & self.mask]);
         let here = &data[cur..cur + max_length];
         // A candidate must agree with `here` at `best.len` to be longer than the best match.
         let agrees = |data: &[u8], prev: usize, len: usize| {
@@ -220,8 +269,7 @@ impl Hasher {
                 }
             }
         }
-        for i in 0..SWEEP {
-            let prev = self.buckets[(key + (i << 3)) & self.mask];
+        for prev in prevs {
             // Positions are kept in 32 bits; the bytes are compared, so a wrapped one only
             // misses.
             let distance = (cur as u32).wrapping_sub(prev) as usize;
@@ -277,6 +325,43 @@ mod tests {
     }
 
     #[test]
+    fn a_range_is_filed_as_one_position_at_a_time() {
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let data: Vec<u8> = (0..4096)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // Runs and repeats, so slots collide and the order of filing matters.
+                if i % 512 < 200 {
+                    b'a' + (x % 3) as u8
+                } else {
+                    x as u8
+                }
+            })
+            .collect();
+        for params in [H4, H54] {
+            for (start, end) in [
+                (0, 0),
+                (0, 3),
+                (5, 9),
+                (0, 4089),
+                (7, 4000),
+                (100, 4081),
+                (4070, 4089),
+            ] {
+                let mut batched = Hasher::new(params, Some(256));
+                let mut single = Hasher::new(params, Some(256));
+                batched.store_range(&data, start..end);
+                for pos in start..end {
+                    single.store(&data, pos);
+                }
+                assert!(batched.buckets == single.buckets, "{start}..{end}");
+            }
+        }
+    }
+
+    #[test]
     fn tables_follow_the_input_size() {
         assert_eq!(Hasher::new(H4, Some(1024)).table_bytes(), 64 << 10);
         assert_eq!(Hasher::new(H4, Some(1000)).table_bytes(), 64 << 10);
@@ -286,6 +371,13 @@ mod tests {
         assert_eq!(Hasher::new(H4, Some(1 << 20)).table_bytes(), 512 << 10);
         assert_eq!(Hasher::new(H54, Some(8 << 20)).table_bytes(), 4 << 20);
         assert_eq!(Hasher::new(H4, None).table_bytes(), 512 << 10);
+        // Either side of a power of two, and hints far past any input.
+        assert_eq!(Hasher::new(H4, Some(1025)).table_bytes(), 128 << 10);
+        assert_eq!(Hasher::new(H4, Some(1)).table_bytes(), 4 << 10);
+        for huge in [usize::MAX, (usize::MAX >> 1) + 2, (usize::MAX >> 1) + 1] {
+            assert_eq!(Hasher::new(H4, Some(huge)).table_bytes(), 512 << 10);
+            assert_eq!(Hasher::new(H54, Some(huge)).table_bytes(), 4 << 20);
+        }
         // Reset smaller keeps the memory.
         let mut h = Hasher::new(H4, None);
         h.reset(H4, Some(100));

@@ -4,7 +4,7 @@
 //! reads and writes it without `unsafe` and without C: anything the reference `brotli` tool
 //! writes decompresses here, and anything this crate writes decompresses with the reference.
 //!
-//! **Status:** 0.1.0, the first release. Decompression works. Compression works at quality 4,
+//! **Status:** 0.1.1. Decompression works. Compression works at quality 4,
 //! as the reference compresses at quality 4: on our test corpus the output is the same size,
 //! give or take 0.2% per entry, in one go or as a stream ([`StreamCompressor`]). Every
 //! quality compresses as 4 does for now.
@@ -155,6 +155,14 @@ impl StreamCompressor {
     /// [`reset`](Self::reset), or before the first write).
     pub fn set_size_hint(&mut self, size_hint: Option<u64>) {
         self.stream.set_size_hint(size_hint.map(hint));
+    }
+
+    /// The next stream's options (after [`finish`](Self::finish) or [`reset`](Self::reset),
+    /// or before the first write), so that one compressor can take each stream at its own
+    /// window, such as [`Options::for_size`] gives it. The stream under way keeps its window.
+    pub fn set_options(&mut self, options: Options) {
+        self.stream
+            .set_lgwin(options.lgwin.clamp(encode::MIN_LGWIN, encode::MAX_LGWIN));
     }
 
     /// Drops the stream under way, if any, without ending it: ready for a new one, with its

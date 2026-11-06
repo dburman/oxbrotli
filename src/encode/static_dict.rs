@@ -73,10 +73,22 @@ pub(crate) fn prepare() {
 
 /// Dictionary searches for one stream: they stop being made once fewer than one in 128 finds
 /// a word, as the reference's do.
-#[derive(Default)]
 pub(crate) struct Search {
     lookups: usize,
     matches: usize,
+    /// Fetched once for the stream: a search then calls nothing and needs no stack frame. Had
+    /// each search fetched it, the call that may build it cost 2% on a 200 KiB script.
+    table: &'static Lookup,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            lookups: 0,
+            matches: 0,
+            table: lookup(),
+        }
+    }
 }
 
 impl Search {
@@ -94,7 +106,7 @@ impl Search {
             return;
         }
         self.lookups += 1;
-        let table = lookup();
+        let table = self.table;
         let (len, index) = table.slots[hash14(data)];
         let (len, index) = (len as usize, index as usize);
         if len == 0 || len > max_length {

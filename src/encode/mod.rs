@@ -182,8 +182,9 @@ impl<'a> Blocks<'a> {
         }
     }
 
-    /// The type of the next symbol, after writing a block switch if a block ends here.
-    #[inline]
+    /// The type of the next symbol, after writing a block switch if a block ends here. Always
+    /// inlined: it runs per symbol, and out of line it cost 2% on large inputs.
+    #[inline(always)]
     fn next(&mut self, w: &mut BitWriter<'_>) -> usize {
         if self.left == 0
             && let Some((type_code, length_code)) = &self.switch
@@ -200,6 +201,17 @@ impl<'a> Blocks<'a> {
         }
         self.left -= 1;
         usize::from(self.split.types[self.block])
+    }
+
+    /// The type of the next `wanted` symbols (at least 1), after writing a block switch if a
+    /// block ends here, and how many of them fit before the next switch: as many calls of
+    /// [`next`](Self::next) would give, one per run.
+    #[inline(always)]
+    fn run(&mut self, w: &mut BitWriter<'_>, wanted: usize) -> (usize, usize) {
+        let t = self.next(w);
+        let more = (self.left as usize).min(wanted - 1);
+        self.left -= more as u32;
+        (t, more + 1)
     }
 }
 
@@ -307,6 +319,14 @@ fn write_compressed(
     }
     let [literal_split, command_split, distance_split] = &*splits;
     let [literal_codes, command_codes, distance_codes] = &codes;
+    // Each literal code's length and bits in one word, by byte: one load per literal, and no
+    // bounds check.
+    let literal_words: Vec<[u32; 256]> = literal_codes
+        .iter()
+        .map(|code| {
+            std::array::from_fn(|b| u32::from(code.lengths[b]) << 16 | u32::from(code.codes[b]))
+        })
+        .collect();
 
     write_length(w, mlen, is_last);
     if !is_last {
@@ -349,10 +369,16 @@ fn write_compressed(
         } else {
             w.put(u32::from(COPY_EXTRA[0]), 0);
         }
-        for &b in &literals[next..next + c.insert as usize] {
-            let code = &literal_codes[literal_blocks.next(w)];
-            let b = b as usize;
-            w.put(u32::from(code.lengths[b]), u32::from(code.codes[b]));
+        let mut rest = &literals[next..next + c.insert as usize];
+        while !rest.is_empty() {
+            let (t, n) = literal_blocks.run(w, rest.len());
+            let words = &literal_words[t];
+            let (now, later) = rest.split_at(n);
+            for &b in now {
+                let word = words[usize::from(b)];
+                w.put(word >> 16, word & 0xffff);
+            }
+            rest = later;
         }
         next += c.insert as usize;
         if k.reads_distance(c) {

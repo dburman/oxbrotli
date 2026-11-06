@@ -2,18 +2,36 @@
 //! lengths (`c/enc/bit_cost.c`, `BrotliBitsEntropy`; `c/enc/entropy_encode.c`,
 //! `BrotliOptimizeHuffmanCountsForRle`).
 
+use std::sync::OnceLock;
+
 /// How far, in 1/256 units, a count may be from its stride's average and still join it.
 const STREAK: i64 = 1240;
+
+/// `log2` of 0 to 255 (0 for 0), computed once: most counts in a block are that small, and
+/// the block splitter takes the entropy of whole histograms several times per block.
+fn small_log2() -> &'static [f64; 256] {
+    static TABLE: OnceLock<[f64; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|i| if i == 0 { 0.0 } else { (i as f64).log2() }))
+}
+
+/// `log2(c)`, from the table when `c` is in it: the same value either way.
+fn log2(table: &[f64; 256], c: u32) -> f64 {
+    table
+        .get(c as usize)
+        .copied()
+        .unwrap_or_else(|| f64::from(c).log2())
+}
 
 /// The bits `counts` take with an ideal code: Shannon's sum, but at least one bit per
 /// symbol, as a prefix code needs.
 pub(crate) fn bits_entropy(counts: &[u32]) -> f64 {
+    let table = small_log2();
     let mut sum = 0u64;
     let mut bits = 0.0;
     for &c in counts {
         if c != 0 {
             sum += u64::from(c);
-            bits -= f64::from(c) * f64::from(c).log2();
+            bits -= f64::from(c) * log2(table, c);
         }
     }
     if sum != 0 {
@@ -257,6 +275,18 @@ mod tests {
             optimize_for_rle(&mut fast);
             optimize_for_rle_by_the_book(&mut plain);
             assert!(fast == plain, "case {case}: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn the_log2_table_is_log2() {
+        let table = super::small_log2();
+        for c in 1..300u32 {
+            assert_eq!(
+                super::log2(table, c).to_bits(),
+                f64::from(c).log2().to_bits(),
+                "{c}"
+            );
         }
     }
 

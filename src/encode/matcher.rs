@@ -14,7 +14,7 @@
 
 use crate::bitwriter::BitWriter;
 use crate::encode::command::{Command, DistanceCode, Ring};
-use crate::encode::hash::{H4, H54, HASH_READ, Hasher, MIN_SCORE, Match, Params};
+use crate::encode::hash::{H4, H54, HASH_READ, Hasher, MIN_SCORE, Match, Params, match_length};
 use crate::encode::{MAX_MLEN, write_empty_last, write_meta_block, write_window};
 
 /// The input block (`lgblock` 16 at quality 4).
@@ -152,9 +152,11 @@ impl Encoder {
             let distance = self.ring.last() as usize;
             let copy_start = start - last.copy as usize;
             if distance <= copy_start.min(self.max_backward) {
-                while position < end && src[position] == src[position - distance] {
-                    position += 1;
-                }
+                position += match_length(
+                    &src[position - distance..],
+                    &src[position..],
+                    end - position,
+                );
                 last.copy += (position - start) as u32;
             }
         }

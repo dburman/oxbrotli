@@ -20,12 +20,13 @@ separate implementation from the RFC:
 - **No dependencies and no C:** no C compiler in the build, nothing to cross-compile but
   Rust, and nothing else to audit.
 
-**Status:** 0.1.0, the first release. Decompression is complete: everything the reference
+**Status:** 0.1.1. Decompression is complete: everything the reference
 writes, at every quality and window, decodes byte for byte, and damaged input gives an error.
 Compression works at quality 4 (every quality compresses as 4 does for now): on the test
 corpus its output is the size of `brotli -q 4`'s, give or take 0.2% per entry, and the
-reference decodes everything it writes, in one go or as a stream with flushes. See
-[`docs/plan/README.md`](docs/plan/README.md) for the milestones.
+reference decodes everything it writes, in one go or as a stream with flushes. Both
+directions run at about the reference's speed ([`docs/benchmarks.md`](docs/benchmarks.md)).
+See [`docs/plan/README.md`](docs/plan/README.md) for the milestones.
 
 ## Use
 
@@ -33,7 +34,7 @@ oxbrotli isn't on crates.io yet. Add it from Git:
 
 ```toml
 [dependencies]
-oxbrotli = { git = "https://github.com/dburman/oxbrotli", tag = "0.1.0" }
+oxbrotli = { git = "https://github.com/dburman/oxbrotli", tag = "0.1.1" }
 ```
 
 ```rust
@@ -46,7 +47,8 @@ assert_eq!(oxbrotli::decompress(&stream).unwrap(), text);
 compresses as quality 4 does for now.
 
 For a body that arrives in pieces, `StreamCompressor` takes it chunk by chunk; `flush` makes
-everything so far decodable, and the compressor keeps its memory from one stream to the next:
+everything so far decodable. The compressor keeps its memory from one stream to the next, and
+`set_options` and `set_size_hint` fit it to each new stream (its window, and its hash table):
 
 ```rust
 use oxbrotli::{Options, StreamCompressor};

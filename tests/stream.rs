@@ -203,6 +203,50 @@ fn a_reused_compressor_writes_what_a_fresh_one_does() {
 }
 
 #[test]
+fn a_reused_compressor_takes_each_stream_at_its_own_window() {
+    let small = text(3000, 9);
+    let large = html(200_000, 10);
+    let fresh =
+        |options: Options, data: &[u8]| one_stream(&mut StreamCompressor::new(options, None), data);
+    let (w12, w18) = (Options::new(4).lgwin(12), Options::new(4).lgwin(18));
+    let mut c = StreamCompressor::new(w18, None);
+    one_stream(&mut c, &large);
+    // Down to a small window, then back up: each as a fresh compressor writes it.
+    c.set_options(w12);
+    assert!(
+        one_stream(&mut c, &small) == fresh(w12, &small),
+        "w18 to w12"
+    );
+    assert!(
+        one_stream(&mut c, &large) == fresh(w12, &large),
+        "kept at w12"
+    );
+    c.set_options(w18);
+    let out = one_stream(&mut c, &large);
+    assert!(out == fresh(w18, &large), "w12 to w18");
+    assert_eq!(out[0] & 0x0f, 0x03, "the w18 header (0011)");
+    // Set during a stream, it waits for the next one.
+    let mut out = Vec::new();
+    c.write(&large[..100_000], &mut out);
+    c.set_options(w12);
+    c.write(&large[100_000..], &mut out);
+    c.finish(&mut out);
+    let mut expected = Vec::new();
+    let mut f = StreamCompressor::new(w18, None);
+    f.write(&large[..100_000], &mut expected);
+    f.write(&large[100_000..], &mut expected);
+    f.finish(&mut expected);
+    assert!(out == expected, "the stream under way keeps w18");
+    assert!(one_stream(&mut c, &large) == fresh(w12, &large), "then w12");
+    // Out of range, as for new: clamped.
+    c.set_options(Options::new(4).lgwin(30));
+    assert!(
+        one_stream(&mut c, &small) == fresh(Options::new(4).lgwin(24), &small),
+        "clamped to 24"
+    );
+}
+
+#[test]
 fn a_thousand_small_streams_take_no_more_memory_than_one() {
     let options = Options::for_size(4, Some(1024), 19);
     let mut c = StreamCompressor::new(options, Some(1024));
@@ -220,6 +264,24 @@ fn a_thousand_small_streams_take_no_more_memory_than_one() {
     }
     // A table fit to 1 KiB (64 KiB of it), and the input it held.
     assert!(after_first < 96 << 10, "{after_first} bytes");
+}
+
+#[test]
+fn any_size_hint_is_taken() {
+    // A server passes on whatever length a response declares, up to u64::MAX.
+    let data = text(5000, 11);
+    for hint in [u64::MAX, 1 << 63, (1 << 63) + 1, u64::from(u32::MAX) + 1, 0] {
+        let options = Options::for_size(4, Some(hint), 19);
+        let mut c = StreamCompressor::new(options, Some(hint));
+        let out = one_stream(&mut c, &data);
+        assert!(oxbrotli::decompress(&out).unwrap() == data, "new, {hint}");
+        c.set_size_hint(Some(hint));
+        let out = one_stream(&mut c, &data);
+        assert!(
+            oxbrotli::decompress(&out).unwrap() == data,
+            "reused, {hint}"
+        );
+    }
 }
 
 #[test]
