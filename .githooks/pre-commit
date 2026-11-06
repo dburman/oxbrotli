@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Strips provenance watermarks from staged files with watermarks-remover's clean_staged.py.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Cleaner location:        $WATERMARKS_REMOVER_DIR (default: ~/git/watermarks-remover)
+#
+# Exit status follows clean_staged.py: if it rewrote any file, the commit stops so the
+# changes can be reviewed and re-staged. If the cleaner is missing, the commit stops too:
+# skipping silently would let uncleaned files through.
+set -euo pipefail
+
+dir="${WATERMARKS_REMOVER_DIR:-$HOME/git/watermarks-remover}"
+cleaner="$dir/service/scripts/clean_staged.py"
+if [ ! -f "$cleaner" ]; then
+    echo "pre-commit: $cleaner not found (set WATERMARKS_REMOVER_DIR)" >&2
+    exit 1
+fi
+
+files=()
+while IFS= read -r -d '' f; do
+    files+=("$f")
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+[ "${#files[@]}" -gt 0 ] || exit 0
+
+# The cleaner can drop the executable bit and leaves a .bak copy of each file. A stale
+# .bak is dangerous: a later run cleans from the .bak instead of the current file.
+# Remember which backups already existed and which files are executable in the index.
+pre_existing=()
+for f in "${files[@]}"; do
+    [ -e "$f.bak" ] && pre_existing+=("$f.bak")
+done
+if [ "${#pre_existing[@]}" -gt 0 ]; then
+    echo "pre-commit: refusing to run with existing backups (the cleaner would read them" >&2
+    echo "instead of the current files). Inspect and remove:" >&2
+    printf '  %s\n' "${pre_existing[@]}" >&2
+    exit 1
+fi
+executable=()
+while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    path=${entry#*$'\t'}
+    [ "$mode" = "100755" ] && executable+=("$path")
+done < <(git ls-files --stage -z -- "${files[@]}")
+
+status=0
+python3 "$cleaner" "${files[@]}" || status=$?
+
+for f in "${executable[@]+"${executable[@]}"}"; do
+    [ -f "$f" ] && chmod +x "$f"
+done
+
+if [ "$status" -eq 3 ]; then
+    echo "pre-commit: some files could not be cleaned; backups were kept for inspection" >&2
+    exit 3
+fi
+for f in "${files[@]}"; do
+    rm -f -- "$f.bak"
+done
+exit "$status"

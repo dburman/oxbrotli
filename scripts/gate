@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# The gate: every check, in order, stopping at the first failure. Run it before calling work
+# done. GitHub Actions runs the same checks when the repository is public.
+#
+#   scripts/gate            everything
+#   scripts/gate --ratio    also the ratio comparison with `brotli -q 4` (slow; from B6 on)
+#
+# The interop tests need the reference `brotli` program on PATH (brew install brotli /
+# apt-get install brotli). They fail without it, never skip.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ratio=
+for arg in "$@"; do
+    case $arg in
+        --ratio) ratio=1 ;;
+        *) echo "gate: unknown option $arg" >&2; exit 2 ;;
+    esac
+done
+
+passed=0
+step() {
+    local name=$1
+    shift
+    echo "== $name"
+    if ! "$@"; then
+        echo "gate: FAILED at \"$name\" (passed $passed steps first)" >&2
+        exit 1
+    fi
+    passed=$((passed + 1))
+}
+
+step "brotli present" brotli --version
+step "fmt" cargo fmt --check
+step "clippy" cargo clippy --all-targets --locked -- -D warnings
+step "tests" cargo test --release --locked
+# The release profile has overflow checks off; damaged input is where an overflow would hide.
+step "damage tests, overflow checks on" cargo test --locked --test damage
+step "benchmarks build" cargo bench --locked --no-run
+step "policy" scripts/check-policy.sh
+step "cargo deny" cargo deny --locked check
+if [ -n "$ratio" ]; then
+    step "ratio" cargo test --release --locked --test ratio -- --ignored --nocapture
+fi
+echo "gate: ok ($passed steps)"

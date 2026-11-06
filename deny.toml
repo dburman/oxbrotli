@@ -1,0 +1,26 @@
+# cargo-deny policy. oxbrotli has no dependencies at all: the allow list is empty, so adding
+# any crate fails `cargo deny check` until the owner approves it.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+
+[licenses]
+allow = ["MIT"]
+confidence-threshold = 0.95
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

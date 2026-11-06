@@ -1,0 +1,83 @@
+[package]
+name = "oxbrotli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Brotli (RFC 7932) compression and decompression in safe Rust, with no dependencies"
+license = "MIT"
+repository = "https://github.com/dburman/oxbrotli"
+readme = "README.md"
+keywords = ["brotli", "compression", "decompression", "safe"]
+categories = ["compression"]
+publish = false
+# What a user of the crate needs: the code, its tests and examples. CI, lint and supply-chain
+# configuration, the toolchain pin and the scripts stay in the repository.
+include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/LICENSE"]
+
+# Its own workspace, also when checked out inside another one (as a submodule, say).
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+let_underscore_drop = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+# A codec indexes tables and buffers on every byte. Indexing is bounds-checked (memory-safe);
+# a panic is still a bug, and the fuzz targets and tests hunt for them. `get()` everywhere
+# would cost a branch per access and hide the real invariant.
+indexing_slicing = "allow"
+# Bit fields, table sizes and lengths move between u8/u16/u32/usize constantly; each cast is
+# within the format's limits.
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Cost estimates are in f64; the counts they come from are far below 2^52.
+cast_precision_loss = "allow"
+# Codec code names things after the format (lgwin, nbltypes, ndirect, npostfix) and the parameter table
+# after its columns.
+similar_names = "allow"
+many_single_char_names = "allow"
+# Bit reads and table lookups in the hot loops may be marked inline(always), each only where a
+# benchmark shows plain #[inline] leaves it out of line and costs speed.
+inline_always = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+string_slice = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+mem_forget = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+exit = "warn"
+allow_attributes_without_reason = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Overflow checks off in release, as in std: lengths are validated where they come in, and a
+# check on every arithmetic step of the hot loops costs measurable speed.
+overflow-checks = false
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[[bench]]
+name = "versus_brotli"
+harness = false
