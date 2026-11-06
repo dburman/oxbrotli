@@ -2,3 +2,4 @@
 **/*.bak
 /bench-data
 /reference
+.DS_Store
