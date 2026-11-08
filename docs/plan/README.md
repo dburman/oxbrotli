@@ -30,7 +30,7 @@ qualities come after.
 | B12 Chain hashers | H5 and H6: buckets of the last 2^(q-1) positions; four last distances tried; two dictionary words per position | Ratio within 1% of `brotli -q 5` / `-q 6` at window 19, with one literal context | Done 2026-11-06: corpus -0.00% in total at both; real files +0.68% (q5), web bodies -0.12% |
 | B13 Forgetful chains | H40 for windows of 16 or less | Ratio within 1% of the reference at windows 10 and 15 | Done 2026-11-08: -0.78% to +0.07% per entry; web bodies -0.13% |
 | B14 Context modeling | Literal contexts (UTF-8 mode): the choice of 1, 2 or 13 contexts, the context block splitter, context maps written in full | Ratio within 0.5% of `brotli -q 5` / `-q 6` at windows 10, 15 and 19 | Done 2026-11-08: corpus -0.03% in total at both; real files +0.04% (q5), +0.09% (q6) |
-| B15 Release | Speed and memory at 5 and 6 measured; docs; 0.2.0 | `docs/benchmarks.md` has quality 5 and 6 rows; gate passes | Not started |
+| B15 Release | Speed and memory at 5 and 6 measured; docs; 0.2.0 | `docs/benchmarks.md` has quality 5 and 6 rows; gate passes | Done 2026-11-08: 5 and 6 at 100% to 117% of the reference's speed; tag on the owner's word |
 
 
 Qualities 5 and 6 are B11 to B15 (planned 2026-11-06). Later and not scheduled: the other
@@ -1105,3 +1105,22 @@ Spec:
   says so.
 
 Done when: the gate passes and the owner has the numbers.
+
+Notes (2026-11-08):
+- *Benchmarks.* `benches/versus_brotli.rs` runs qualities 4 to 6 by default;
+  `docs/benchmarks.md` has their sizes and speeds, memory per compressor and per process, and
+  where quality 5's time goes. Compression at 5 and 6 runs at 100% to 117% of the reference's
+  speed where it is measured (from 256 KiB), within the 10% asked; the output is within 0.07%
+  of the reference's per entry from 64 KiB up.
+- *Profile* (macOS `sample`, quality 5): the chain walk is 56% of a 1.1 MB script's time and
+  39% of a 3 KB page's, the matcher loop 13% and 18%, the dictionary 4% and 12%; literal
+  contexts and their histograms 10% on the script (13 contexts). Nothing stood out to tune
+  before the release.
+- *Memory.* At 5 and 6 and windows of 16 or less (bodies to 64 KiB, by `for_size`) a
+  compressor holds 512 KiB of chains whatever the body's size, as the reference; quality 4
+  holds 70 KiB for a 1 KiB body. A server pooling compressors for small bodies at quality 5
+  pays that per compressor. Peak process memory is the reference's or less, but for 1 KiB at 5
+  and 6 (2.6 MiB against 2.5).
+- *Release.* Version 0.2.0: what `Options::quality` does changed (5 and 6 are their own;
+  7 to 11 compress as 6). oxgate requires oxbrotli `0.1.1` by path, which 0.2.0 doesn't meet:
+  its `Cargo.toml` and submodule pointer move to 0.2.0 together, when the owner releases.

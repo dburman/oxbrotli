@@ -1,7 +1,7 @@
 //! Ratio and speed against the reference `brotli` tool.
 //!
 //! `cargo bench --bench versus_brotli -- [--rounds=N] [qualities] [names]`: qualities like
-//! `4` or `0-11` (default 4), names filter the corpus. Files in `bench-data/` are added to the
+//! `4` or `0-11` (default 4-6, the qualities with encoders of their own), names filter the corpus. Files in `bench-data/` are added to the
 //! corpus. Each input is compressed with the window `Options::for_size` gives it (at most 22),
 //! by both.
 //!
@@ -37,7 +37,7 @@ const TOOL_MIN: usize = 256 << 10;
 
 fn qualities(arg: Option<&str>) -> Vec<u32> {
     let Some(arg) = arg else {
-        return vec![4];
+        return vec![4, 5, 6];
     };
     let mut out = Vec::new();
     for part in arg.split(',') {

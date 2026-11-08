@@ -4,12 +4,13 @@
 //! reads and writes it without `unsafe` and without C: anything the reference `brotli` tool
 //! writes decompresses here, and anything this crate writes decompresses with the reference.
 //!
-//! **Status:** 0.1.1. Decompression works. Compression works at quality 4,
-//! as the reference compresses at quality 4: on our test corpus the output is the same size,
-//! give or take 0.2% per entry, in one go or as a stream ([`StreamCompressor`]). Qualities
-//! 0 to 3 compress as 4 does. Qualities 5 and 6 are in progress: they search further for
-//! matches, as the reference does, but don't yet model literals by context; 7 to 11 compress
-//! as 6 does.
+//! **Status:** 0.2.0. Decompression works. Compression works at qualities 4, 5 and 6, as the
+//! reference compresses at each: on our test corpus the output is the same size, give or take
+//! 0.5% per entry, in one go or as a stream ([`StreamCompressor`]), at about the reference's
+//! speed. Quality 4 is the fastest; 5 searches further for matches and codes literals by
+//! context, for output 1% to 14% smaller at about 60% of the speed; 6 searches further still,
+//! another 1% to 6% smaller at about half 4's speed. Qualities 0 to 3 compress as 4 does, and
+//! 7 to 11 as 6 does.
 //!
 //! ```
 //! let text = b"Brotli in safe Rust. ".repeat(100);
@@ -47,7 +48,7 @@ use encode::Level;
 #[non_exhaustive]
 pub struct Options {
     /// The quality, 0 to 11 as in the reference `brotli`: higher is smaller and slower.
-    /// Qualities 0 to 3 compress as 4 does, and 7 to 11 as 6 does, for now.
+    /// 4, 5 and 6 compress as the reference's do; 0 to 3 compress as 4, and 7 to 11 as 6.
     pub quality: u32,
     /// The window: back-references reach up to `2^lgwin - 16` bytes, and a decoder keeps that
     /// much of the output. 10 to 24; values outside are clamped. The default is 22, as the
@@ -102,8 +103,8 @@ impl Default for Options {
     }
 }
 
-/// Compresses `src` at `quality` (0 to 11; for now 0 to 3 compress as 4, and 7 to 11 as 6)
-/// with the default window.
+/// Compresses `src` at `quality` (0 to 11; 0 to 3 compress as 4, and 7 to 11 as 6) with the
+/// default window.
 #[must_use]
 pub fn compress(src: &[u8], quality: u32) -> Vec<u8> {
     compress_with(src, Options::new(quality))
@@ -126,10 +127,12 @@ pub fn compress_with(src: &[u8], options: Options) -> Vec<u8> {
 /// flushes, a stream compresses exactly as [`compress_with`] would compress it whole, given the
 /// same size hint.
 ///
-/// It holds the hash table (up to 512 KiB, or 4 MiB with a size hint of 1 MiB or more; less
-/// for a small size hint) and at most `2^(lgwin + 1) + 2^(1 + max(lgwin, 16)) + 64 KiB` bytes
+/// It holds the hash table and at most `2^(lgwin + 1) + 2^(1 + max(lgwin, 16)) + 64 KiB` bytes
 /// of input: two windows, the longest meta-block and an input block (16 MiB at the default
-/// window; 1.1 MiB at window 18).
+/// window; 1.1 MiB at window 18). The hash table is sized to the size hint, up to: at quality
+/// 4, 512 KiB, or 4 MiB with a hint of 1 MiB or more; at 5, 1 MiB, or 2 MiB with such a hint at
+/// windows from 19; at 6, 2 MiB, or 4 MiB with such a hint. At 5 and 6 and windows of 16 or
+/// less it is a fixed 512 KiB instead, as the reference's, whatever the hint.
 ///
 /// ```
 /// let mut c = oxbrotli::StreamCompressor::new(oxbrotli::Options::new(4), None);
