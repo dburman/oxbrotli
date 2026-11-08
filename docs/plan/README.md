@@ -28,7 +28,7 @@ qualities come after.
 | B9 Speed | Profiling-driven work on the hot loops; `benches/versus_brotli.rs`; `docs/benchmarks.md` | Faster than the `brotli` crate at q4 on web-sized bodies (1 KiB to 1 MiB) | Done 2026-11-06: as fast as the C reference (the crate comparison is the caller's, B10) |
 | B11 Quality levels | `Options::quality` chooses the encoder: 5 and 6 get their own, 0-4 compress as 4, 7-11 as 6 | Tests pin the mapping; quality 4 output unchanged | Done 2026-11-06 |
 | B12 Chain hashers | H5 and H6: buckets of the last 2^(q-1) positions; four last distances tried; two dictionary words per position | Ratio within 1% of `brotli -q 5` / `-q 6` at window 19, with one literal context | Done 2026-11-06: corpus -0.00% in total at both; real files +0.68% (q5), web bodies -0.12% |
-| B13 Forgetful chains | H40 for windows of 16 or less | Ratio within 1% of the reference at windows 10 and 15 | Not started |
+| B13 Forgetful chains | H40 for windows of 16 or less | Ratio within 1% of the reference at windows 10 and 15 | Done 2026-11-08: -0.78% to +0.07% per entry; web bodies -0.13% |
 | B14 Context modeling | Literal contexts (UTF-8 mode): the choice of 1, 2 or 13 contexts, the context block splitter, context maps written in full | Ratio within 0.5% of `brotli -q 5` / `-q 6` at windows 10, 15 and 19 | Not started |
 | B15 Release | Speed and memory at 5 and 6 measured; docs; 0.2.0 | `docs/benchmarks.md` has quality 5 and 6 rows; gate passes | Not started |
 
@@ -946,6 +946,50 @@ Tests:
   above 1%.
 
 Done when: the gate passes and the ratio is within 1% at windows 10 and 15.
+
+Notes (2026-11-07):
+- *The hasher.* `src/encode/forgetful.rs`, the reference's layout and order of checks, behind
+  the same `Finder` as the others; the encoder picks it as `ChooseHasher` does: qualities 5
+  and 6 at windows of 16 or less. Rebasing a stream moves the tiny hashes with their
+  positions (a rotation of the 64 KiB array): they are indexed by a position's low 16 bits.
+- *Ratio, generated corpus* (ours against `brotli -q 5`; quality 6 against `-q 6` alike):
+  window 10 -0.78% to +0.01% (the 100-byte text +2 bytes), window 15 -0.07% to +0.01%,
+  window 19 unchanged. Window 10 coming out smaller is quality 4's behaviour too.
+- *Ratio, web-sized bodies* (1 to 64 KiB, at the window `for_size` picks): -0.13% in total at
+  quality 5, -0.15% at 6, worst +0.41% (HTML 4 KiB). `tests/ratio.rs` holds them to 1%.
+- *Ratio, `bench-data/`* as served: +0.73% in total at quality 5. Four dictionary-heavy
+  HTML pages at windows 14 and 15 come out +0.7% to +1.2%. Their commands, traced through our
+  decoder, match the reference's in kind (the same 2- and 3-byte copies, within 1% of its
+  copies from the window), but its dictionary copies are longer: 197 copying 1,425 bytes
+  against our 204 copying 1,339 (`nightsky`). That is the reference's tuned word choice
+  (B9, B12), weighing more with two words looked up per position. The 1.1 MB script
+  (+1.25%) is hinted at 1 MiB or more, where the reference also models literals by context
+  (B14). The owner chose an interim limit: 1.5% for real files at 5 and 6 (outputs under
+  1 KiB 4 bytes more), revisited after B14.
+- *Reset.* Clearing the newest positions and tiny hashes, 256 KiB, cost a 135-byte body
+  4.4 µs at quality 5 (8.5 µs at quality 4, 12.9 at 5), reused as oxgate's pool does.
+  Tried: noting the chains a stream starts as it files them, to clear just those. Small
+  bodies gained, but 9 to 20 KiB bodies lost 15% to 20% (the branch and push on every
+  position). Kept: when a stream ends, if it was 4 KiB or less and never rebased, it hashes
+  its positions again and empties their chains and tiny hashes, as the reference prepares a
+  small input, but at the end; the next reset then skips the clear. The heads and nodes are
+  never cleared: a chain's first node holds the capped delta, so no walk goes past it.
+  Reused, at quality 5: 135 B 12.9 to 9.9 µs, 518 B 23.9 to 20.5, 1.4 KiB 34.2 to 31.5;
+  larger bodies unchanged. A 16 KiB limit was slower from 6 KiB on (re-hashing costs more
+  than the clear there).
+- *Memory.* 512 KiB per compressor at these windows (newest positions 128 KiB, heads 64,
+  tiny hashes 64, nodes 256), as the reference.
+- *Interop.* The 90-file sweep of B12 again (qualities 4 to 6, windows 10 to 24, both ways,
+  streamed with flushes too): 12,150 checks, none failed. A reused compressor at windows 10
+  and 16 writes, after short, long, rebased and empty streams, what a fresh one does.
+- *Mutations.* 22 tried. Killed by the tests: the tiny hash skipped or checked from the
+  first distance, the penalty, deltas cut to 16 bits instead of capped, 4 hops a quality
+  step instead of 8, the search not filing its position, the tiny hashes not rotated, a
+  rebase leaving the newest positions, each part of the end-of-stream clean-up (positions,
+  tiny hashes, one short, after a rebase, a rebase after it, never called, the reset not
+  checking it), and the window that picks the hasher (17, or never). Killed by the ratio
+  test: last-distance copies of 2 refused, the dictionary shallow or off. Equivalent: the
+  walk going on past the window (deltas only add), a chain match of 3 (as in B12).
 
 ---
 

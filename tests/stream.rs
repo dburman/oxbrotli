@@ -227,6 +227,45 @@ fn a_reused_compressor_takes_each_stream_at_its_own_quality() {
 }
 
 #[test]
+fn a_reused_compressor_at_small_windows_writes_what_a_fresh_one_does() {
+    // Qualities 5 and 6 at windows of 16 or less clear only what a short stream filed: each
+    // stream here, after short ones, long ones (which move positions at window 10) and an
+    // empty one, must come out as from a fresh compressor.
+    let bodies = [
+        html(1000, 41),
+        text(3000, 42),
+        text(4096, 43),
+        html(40_000, 44),
+        Vec::new(),
+        common::js(700, 45),
+        html(1000, 41),
+        common::random(2000, 46),
+        html(9, 47),
+    ];
+    for quality in [5, 6] {
+        for lgwin in [10, 16] {
+            let options = Options::new(quality).lgwin(lgwin);
+            let mut c = StreamCompressor::new(options, None);
+            for (i, data) in bodies.iter().enumerate() {
+                for hint in [None, Some(data.len() as u64)] {
+                    let mut fresh = StreamCompressor::new(options, hint);
+                    c.set_options(options);
+                    let out = one_stream(&mut c, data);
+                    assert!(
+                        out == one_stream(&mut fresh, data),
+                        "q{quality} w{lgwin} body {i}"
+                    );
+                    assert!(
+                        oxbrotli::decompress(&out).unwrap() == *data,
+                        "q{quality} w{lgwin} body {i}: round trip"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_reused_compressor_takes_each_stream_at_its_own_window() {
     let small = text(3000, 9);
     let large = html(200_000, 10);

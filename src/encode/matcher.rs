@@ -15,6 +15,7 @@
 use crate::bitwriter::BitWriter;
 use crate::encode::chain::{self, Chain};
 use crate::encode::command::{Command, DistanceCode, Ring};
+use crate::encode::forgetful::Forgetful;
 use crate::encode::hash::{Finder, H4, H54, Hasher, MIN_SCORE, Match, Params, match_length};
 use crate::encode::{Level, MAX_MLEN, write_empty_last, write_meta_block, write_window};
 
@@ -33,14 +34,26 @@ const RESERVE_LIMIT: usize = 16 << 10;
 /// Inputs this large use the bigger hash table (H54), as the reference does given the size.
 const LARGE_INPUT: usize = 1 << 20;
 
+/// Which match finder a stream uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Search {
+    /// Quality 4's hash table (H4, H54).
+    Quick,
+    /// Qualities 5 and 6 at windows over 16 (H5, H6).
+    Chain,
+    /// Qualities 5 and 6 at windows of 16 or less (H40).
+    Forgetful,
+}
+
 /// The state of one stream being compressed.
 pub(crate) struct Encoder {
-    /// What the quality selects: the hasher, so far.
-    level: Level,
+    /// The match finder the quality and window select.
+    search: Search,
     /// Quality 4's hasher.
     hasher: Hasher,
-    /// The hasher of qualities 5 and 6 (empty at quality 4).
+    /// The hashers of qualities 5 and 6 (each empty until a stream uses it).
     chain: Chain,
+    forgetful: Forgetful,
     ring: Ring,
     /// The ring as the last meta-block left it: an uncompressed meta-block goes back to it.
     saved_ring: Ring,
@@ -61,9 +74,10 @@ impl Encoder {
     /// `level`.
     pub(crate) fn new(size_hint: Option<usize>, lgwin: u32, level: Level) -> Self {
         let mut e = Self {
-            level,
+            search: Search::Quick,
             hasher: Hasher::default(),
             chain: Chain::default(),
+            forgetful: Forgetful::default(),
             ring: Ring::START,
             saved_ring: Ring::START,
             max_backward: 0,
@@ -90,7 +104,7 @@ impl Encoder {
     /// The chain hasher at `level` for a stream of `size_hint` bytes with window `lgwin`
     /// (`ChooseHasher`): H6 for 1 MiB or more at windows of 19 or more, otherwise H5.
     fn chain_params(level: Level, size_hint: Option<usize>, lgwin: u32) -> chain::Params {
-        let quality = if level == Level::Q5 { 5 } else { 6 };
+        let quality = level.quality();
         if size_hint.is_some_and(|n| n >= LARGE_INPUT) && lgwin >= 19 {
             chain::Params {
                 bucket_bits: 15,
@@ -108,12 +122,18 @@ impl Encoder {
 
     /// Ready for a new stream, as [`new`](Self::new) would make it, keeping its memory.
     pub(crate) fn reset(&mut self, size_hint: Option<usize>, lgwin: u32, level: Level) {
-        self.level = level;
-        if level == Level::Q4 {
-            self.hasher.reset(Self::params(size_hint), size_hint);
-        } else {
-            self.chain
-                .reset(Self::chain_params(level, size_hint, lgwin), size_hint);
+        // As the reference's `ChooseHasher`: by quality, then window, then size.
+        self.search = match level {
+            Level::Q4 => Search::Quick,
+            _ if lgwin <= 16 => Search::Forgetful,
+            _ => Search::Chain,
+        };
+        match self.search {
+            Search::Quick => self.hasher.reset(Self::params(size_hint), size_hint),
+            Search::Chain => self
+                .chain
+                .reset(Self::chain_params(level, size_hint, lgwin), size_hint),
+            Search::Forgetful => self.forgetful.reset(level.quality()),
         }
         self.ring = Ring::START;
         self.saved_ring = Ring::START;
@@ -152,6 +172,7 @@ impl Encoder {
         debug_assert!(by <= self.flushed);
         self.hasher.rebase(by);
         self.chain.rebase(by);
+        self.forgetful.rebase(by);
         self.flushed -= by;
     }
 
@@ -159,6 +180,7 @@ impl Encoder {
     pub(crate) fn capacity_bytes(&self) -> usize {
         self.hasher.capacity_bytes()
             + self.chain.capacity_bytes()
+            + self.forgetful.capacity_bytes()
             + self.commands.capacity() * size_of::<Command>()
             + self.literals.capacity()
     }
@@ -169,6 +191,7 @@ impl Encoder {
     pub(crate) fn footprint(&self) -> usize {
         self.hasher.table_bytes()
             + self.chain.capacity_bytes()
+            + self.forgetful.capacity_bytes()
             + self.commands.capacity() * size_of::<Command>()
             + self.literals.capacity()
             + self.commands.len() * size_of::<crate::encode::command::Coded>()
@@ -178,14 +201,22 @@ impl Encoder {
     /// Finds the commands for `src[start..end]`, one input block.
     pub(crate) fn process(&mut self, src: &[u8], start: usize, end: usize) {
         // The hasher comes out of `self` for the loop, so the loop can borrow the rest.
-        if self.level == Level::Q4 {
-            let mut f = std::mem::take(&mut self.hasher);
-            self.process_with(&mut f, src, start, end);
-            self.hasher = f;
-        } else {
-            let mut f = std::mem::take(&mut self.chain);
-            self.process_with(&mut f, src, start, end);
-            self.chain = f;
+        match self.search {
+            Search::Quick => {
+                let mut f = std::mem::take(&mut self.hasher);
+                self.process_with(&mut f, src, start, end);
+                self.hasher = f;
+            }
+            Search::Chain => {
+                let mut f = std::mem::take(&mut self.chain);
+                self.process_with(&mut f, src, start, end);
+                self.chain = f;
+            }
+            Search::Forgetful => {
+                let mut f = std::mem::take(&mut self.forgetful);
+                self.process_with(&mut f, src, start, end);
+                self.forgetful = f;
+            }
         }
     }
 
@@ -348,6 +379,9 @@ impl Encoder {
         }
         self.saved_ring = self.ring;
         self.flushed = end;
+        if is_last && self.search == Search::Forgetful {
+            self.forgetful.finish(&src[..end]);
+        }
         self.commands.clear();
         self.literals.clear();
     }
@@ -623,6 +657,37 @@ mod tests {
             });
             assert!(found, "{level:?}");
         }
+    }
+
+    #[test]
+    fn the_search_follows_the_quality_and_window() {
+        use super::Search;
+        for (level, lgwin, search) in [
+            (Level::Q4, 10, Search::Quick),
+            (Level::Q4, 22, Search::Quick),
+            (Level::Q5, 10, Search::Forgetful),
+            (Level::Q5, 16, Search::Forgetful),
+            (Level::Q5, 17, Search::Chain),
+            (Level::Q6, 16, Search::Forgetful),
+            (Level::Q6, 24, Search::Chain),
+        ] {
+            let e = Encoder::new(Some(1000), lgwin, level);
+            assert_eq!(e.search, search, "{level:?} w{lgwin}");
+        }
+    }
+
+    #[test]
+    fn a_short_stream_clears_its_chains_as_it_ends() {
+        let src = noise(3000, 31);
+        let mut out = Vec::new();
+        let mut w = BitWriter::new(&mut out);
+        write_window(&mut w, 12);
+        let mut e = Encoder::new(Some(src.len()), 12, Level::Q5);
+        e.process(&src, 0, src.len());
+        e.flush(&mut w, &src, src.len(), false);
+        assert!(!e.forgetful.is_clean(), "not before the stream ends");
+        e.flush(&mut w, &src, src.len(), true);
+        assert!(e.forgetful.is_clean());
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub(crate) struct Params {
 
 /// What the reference takes off a last distance's score for being the second to fourth
 /// (`BackwardReferencePenaltyUsingLastDistance`): 39 plus 0 to 14, by a packed table.
-fn last_distance_penalty(i: usize) -> usize {
+pub(crate) fn last_distance_penalty(i: usize) -> usize {
     39 + ((0x1_ca10 >> (i & 0xe)) & 0xe)
 }
 

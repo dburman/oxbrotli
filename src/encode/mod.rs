@@ -3,6 +3,7 @@
 
 pub(crate) mod chain;
 pub(crate) mod command;
+pub(crate) mod forgetful;
 pub(crate) mod hash;
 pub(crate) mod histogram;
 pub(crate) mod huffman;
@@ -48,6 +49,15 @@ impl Level {
             0..=4 => Self::Q4,
             5 => Self::Q5,
             _ => Self::Q6,
+        }
+    }
+
+    /// The quality the level compresses as.
+    pub(crate) fn quality(self) -> u32 {
+        match self {
+            Self::Q4 => 4,
+            Self::Q5 => 5,
+            Self::Q6 => 6,
         }
     }
 }

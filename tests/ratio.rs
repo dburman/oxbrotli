@@ -40,8 +40,7 @@ fn quality_4_is_within_the_limit_of_the_reference() {
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn quality_5_is_within_the_limit_of_the_reference() {
-    // Windows of 16 or less use another hasher (B13).
-    let (report, over) = corpus_within(5, &[19], CHAIN_LIMIT, SMALL_SLACK);
+    let (report, over) = corpus_within(5, &[10, 15, 19], CHAIN_LIMIT, SMALL_SLACK);
     println!("{report}");
     assert!(over.is_empty(), "over the limit: {over:?}");
 }
@@ -49,7 +48,7 @@ fn quality_5_is_within_the_limit_of_the_reference() {
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn quality_6_is_within_the_limit_of_the_reference() {
-    let (report, over) = corpus_within(6, &[19], CHAIN_LIMIT, SMALL_SLACK);
+    let (report, over) = corpus_within(6, &[10, 15, 19], CHAIN_LIMIT, SMALL_SLACK);
     println!("{report}");
     assert!(over.is_empty(), "over the limit: {over:?}");
 }
@@ -128,10 +127,38 @@ const SMALL_LIMIT: f64 = 1.02;
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn web_sized_bodies_are_within_the_limit_of_the_reference() {
+    let (report, worst) = web_sized(4);
+    println!("{report}");
+    assert!(
+        worst.0 <= SMALL_LIMIT,
+        "{} is {:+.2}% larger",
+        worst.1,
+        (worst.0 - 1.0) * 100.0
+    );
+}
+
+#[test]
+#[ignore = "slow; run by scripts/gate --ratio"]
+fn web_sized_bodies_at_quality_5_and_6_are_within_the_limit_of_the_reference() {
+    for quality in [5, 6] {
+        let (report, worst) = web_sized(quality);
+        println!("{report}");
+        assert!(
+            worst.0 <= CHAIN_LIMIT,
+            "quality {quality}: {} is {:+.2}% larger",
+            worst.1,
+            (worst.0 - 1.0) * 100.0
+        );
+    }
+}
+
+/// Generated HTML, CSS, JS and JSON bodies of 1 to 64 KiB at `quality`, each at the window
+/// `Options::for_size` picks: the table, and the worst ratio to the reference's and its body.
+fn web_sized(quality: u32) -> (String, (f64, String)) {
     let mut worst = (0.0f64, String::new());
     let (mut ours_total, mut theirs_total) = (0, 0);
-    println!(
-        "{:<12} {:>4} {:>8} {:>8} {:>8}",
+    let mut report = format!(
+        "q{quality} {:<9} {:>4} {:>8} {:>8} {:>8}",
         "body", "w", "ours", "ref", "size"
     );
     for len in [1 << 10, 4 << 10, 16 << 10, 64 << 10] {
@@ -142,10 +169,10 @@ fn web_sized_bodies_are_within_the_limit_of_the_reference() {
             ("json", common::json),
         ] {
             let data = make(len, 31);
-            let options = oxbrotli::Options::for_size(4, Some(len as u64), 22);
+            let options = oxbrotli::Options::for_size(quality, Some(len as u64), 22);
             let ours = oxbrotli::compress_with(&data, options);
             assert!(oxbrotli::decompress(&ours).unwrap() == data, "{kind} {len}");
-            let theirs = brotli_file(&data, 4, options.lgwin).len();
+            let theirs = brotli_file(&data, quality, options.lgwin).len();
             let ratio = ours.len() as f64 / theirs as f64;
             let name = format!("{kind}-{}k", len >> 10);
             if ratio > worst.0 {
@@ -153,30 +180,34 @@ fn web_sized_bodies_are_within_the_limit_of_the_reference() {
             }
             ours_total += ours.len();
             theirs_total += theirs;
-            println!(
-                "{name:<12} {:>4} {:>8} {theirs:>8} {:>+7.2}%",
+            write!(
+                report,
+                "\n{name:<12} {:>4} {:>8} {theirs:>8} {:>+7.2}%",
                 options.lgwin,
                 ours.len(),
                 (ratio - 1.0) * 100.0
-            );
+            )
+            .unwrap();
         }
     }
-    println!(
-        "total: {ours_total}/{theirs_total} {:+.2}%; worst {} {:+.2}%",
+    write!(
+        report,
+        "\ntotal: {ours_total}/{theirs_total} {:+.2}%; worst {} {:+.2}%",
         (ours_total as f64 / theirs_total as f64 - 1.0) * 100.0,
         worst.1,
         (worst.0 - 1.0) * 100.0
-    );
-    assert!(
-        worst.0 <= SMALL_LIMIT,
-        "{} is {:+.2}% larger",
-        worst.1,
-        (worst.0 - 1.0) * 100.0
-    );
+    )
+    .unwrap();
+    (report, worst)
 }
 
 /// How much larger than the reference's a real response may be, compressed as served.
 const REAL_LIMIT: f64 = 1.01;
+/// The same at qualities 5 and 6, for now (owner's choice, 2026-11-07): the reference's tuned
+/// choice of dictionary words weighs more when two are looked up per position, up to 1.2% on
+/// dictionary-heavy pages at windows 14 and 15 (see B13 in `docs/plan/README.md`). Revisited
+/// after B14.
+const CHAIN_REAL_LIMIT: f64 = 1.015;
 
 /// Files in `bench-data/` (real responses, kept locally), each at the window
 /// `Options::for_size` picks for it, as a server compresses them. They need more room than the
@@ -185,45 +216,71 @@ const REAL_LIMIT: f64 = 1.01;
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn real_responses_as_served_are_within_the_limit_of_the_reference() {
+    for (quality, limit) in [
+        (4, REAL_LIMIT),
+        (5, CHAIN_REAL_LIMIT),
+        (6, CHAIN_REAL_LIMIT),
+    ] {
+        let Some((report, over)) = real_responses(quality, limit) else {
+            println!("no files in bench-data/");
+            return;
+        };
+        println!("{report}");
+        assert!(
+            over.is_empty(),
+            "quality {quality}: over the limit: {over:?}"
+        );
+    }
+}
+
+/// The files of `bench-data/` at `quality`, each at the window `Options::for_size` picks: the
+/// table, and the files more than `limit` times the reference's (and, from quality 5, more
+/// than [`SMALL_SLACK`] bytes over, for outputs under 1 KiB); none if there are no files.
+fn real_responses(quality: u32, limit: f64) -> Option<(String, Vec<String>)> {
     let real: Vec<(String, Vec<u8>)> = corpus()
         .into_iter()
         .filter(|(name, data)| name.starts_with("bench-data/") && !data.is_empty())
         .collect();
     if real.is_empty() {
-        println!("no files in bench-data/");
-        return;
+        return None;
     }
     let mut worst = (0.0f64, String::new());
+    let mut over = Vec::new();
+    let slack = if quality > 4 { SMALL_SLACK } else { 0 };
     let (mut ours_total, mut theirs_total) = (0, 0);
+    let mut report = format!("q{quality}");
     for (name, data) in &real {
-        let options = oxbrotli::Options::for_size(4, Some(data.len() as u64), 22);
+        let options = oxbrotli::Options::for_size(quality, Some(data.len() as u64), 22);
         let ours = oxbrotli::compress_with(data, options);
         assert!(oxbrotli::decompress(&ours).unwrap() == *data, "{name}");
-        let theirs = brotli_file(data, 4, options.lgwin).len();
+        let theirs = brotli_file(data, quality, options.lgwin).len();
         let ratio = ours.len() as f64 / theirs as f64;
         if ratio > worst.0 {
             worst = (ratio, name.clone());
         }
+        let allowed = if theirs < 1024 { slack } else { 0 };
+        if ours.len() as f64 > theirs as f64 * limit + allowed as f64 {
+            over.push(format!("{name} {:+.2}%", (ratio - 1.0) * 100.0));
+        }
         ours_total += ours.len();
         theirs_total += theirs;
-        println!(
-            "{name:<48} {:>9} w{:<2} {:>8} {theirs:>8} {:>+7.2}%",
+        write!(
+            report,
+            "\n{name:<48} {:>9} w{:<2} {:>8} {theirs:>8} {:>+7.2}%",
             data.len(),
             options.lgwin,
             ours.len(),
             (ratio - 1.0) * 100.0
-        );
+        )
+        .unwrap();
     }
-    println!(
-        "total: {ours_total}/{theirs_total} {:+.2}%; worst {} {:+.2}%",
+    write!(
+        report,
+        "\ntotal: {ours_total}/{theirs_total} {:+.2}%; worst {} {:+.2}%",
         (ours_total as f64 / theirs_total as f64 - 1.0) * 100.0,
         worst.1,
         (worst.0 - 1.0) * 100.0
-    );
-    assert!(
-        worst.0 <= REAL_LIMIT,
-        "{} is {:+.2}% larger",
-        worst.1,
-        (worst.0 - 1.0) * 100.0
-    );
+    )
+    .unwrap();
+    Some((report, over))
 }
