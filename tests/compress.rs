@@ -94,3 +94,34 @@ fn every_quality_gives_a_valid_stream() {
         assert_eq!(unbrotli(&stream).unwrap(), data, "quality {quality}");
     }
 }
+
+/// FNV-1a: a fingerprint of a stream.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+#[test]
+fn quality_4_output_is_pinned() {
+    // Qualities 5 and up change the encoder around quality 4's, which must write what it
+    // always has (checked byte for byte against the encoder before B14 on the corpus and
+    // `bench-data/`): fingerprints of its streams for text, markup and UTF-8.
+    // Name, input, window, and the stream's length and fingerprint.
+    let cases: [(&str, Vec<u8>, u32, Pin); 3] = [
+        ("text", common::text(20_000, 1), 22, PIN_TEXT),
+        ("html", common::html(5_000, 2), 16, PIN_HTML),
+        ("utf8", common::utf8_text(30_000, 3), 10, PIN_UTF8),
+    ];
+    for (name, data, lgwin, pin) in cases {
+        let out = oxbrotli::compress_with(&data, oxbrotli::Options::new(4).lgwin(lgwin));
+        assert_eq!((out.len(), fnv(&out)), pin, "{name}");
+    }
+}
+
+/// A stream's length and fingerprint.
+type Pin = (usize, u64);
+
+const PIN_TEXT: Pin = (6445, 8_494_504_788_070_808_472);
+const PIN_HTML: Pin = (1272, 16_233_511_495_893_429_143);
+const PIN_UTF8: Pin = (6467, 9_297_582_356_251_961_978);

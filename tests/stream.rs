@@ -76,10 +76,10 @@ fn without_flushes_a_stream_is_the_one_shot_stream() {
 
 /// Writes `data` in random pieces with a flush after each, checking that the output so far,
 /// ended with an empty last meta-block, decodes to what was written; by the reference too,
-/// every `reference_every` flushes.
-fn check_flushes(data: &[u8], options: Options, seed: u64, reference_every: usize) {
+/// every `reference_every` flushes. The compressor is told the size if `hint`.
+fn check_flushes(data: &[u8], options: Options, seed: u64, reference_every: usize, hint: bool) {
     let mut rng = Rng::new(seed);
-    let mut c = StreamCompressor::new(options, None);
+    let mut c = StreamCompressor::new(options, hint.then_some(data.len() as u64));
     let mut out = Vec::new();
     let mut written = 0;
     let mut flushes = 0;
@@ -116,10 +116,56 @@ fn check_flushes(data: &[u8], options: Options, seed: u64, reference_every: usiz
 fn after_each_flush_the_output_so_far_decodes() {
     let data = html(600_000, 11);
     for (quality, lgwin, seed) in [(4, 10, 1), (4, 16, 2), (4, 22, 3), (5, 10, 4), (6, 22, 5)] {
-        check_flushes(&data, Options::new(quality).lgwin(lgwin), seed, 5);
+        check_flushes(&data, Options::new(quality).lgwin(lgwin), seed, 5, false);
     }
     // Noise, stored uncompressed and so already on byte boundaries.
-    check_flushes(&common::random(200_000, 4), Options::new(4), 5, 3);
+    check_flushes(&common::random(200_000, 4), Options::new(4), 5, 3, false);
+}
+
+#[test]
+fn a_hint_of_a_mebibyte_lets_text_take_thirteen_contexts() {
+    // At window 18 the hint doesn't change the hasher; it lets long text of sentences, with
+    // capitals, punctuation and numbers, code its literals in 13 contexts, which pays.
+    let words = [
+        "The",
+        "quick, brown",
+        "fox.",
+        "Jumps (over)",
+        "the lazy",
+        "dog;",
+        "42%",
+    ];
+    let mut rng = Rng::new(14);
+    let mut data = Vec::new();
+    while data.len() < 1_200_000 {
+        data.extend_from_slice(words[rng.below(words.len() as u64) as usize].as_bytes());
+        data.push(if rng.below(10) == 0 { b'\n' } else { b' ' });
+    }
+    let options = Options::new(5).lgwin(18);
+    let sizes = [None, Some(data.len() as u64)].map(|hint| {
+        let mut c = StreamCompressor::new(options, hint);
+        let mut out = Vec::new();
+        c.write(&data, &mut out);
+        c.finish(&mut out);
+        assert!(oxbrotli::decompress(&out).unwrap() == data, "hint {hint:?}");
+        out.len()
+    });
+    assert!(sizes[1] < sizes[0], "{sizes:?}");
+}
+
+#[test]
+fn after_each_flush_literals_coded_by_context_decode() {
+    // UTF-8 text: two contexts from quality 5, so a meta-block after a flush, often starting
+    // inside a letter, takes its first literals' contexts from the bytes before the flush.
+    let data = common::utf8_text(300_000, 12);
+    for (quality, lgwin, seed) in [(5, 10, 6), (5, 19, 7), (6, 16, 8), (6, 22, 9)] {
+        check_flushes(&data, Options::new(quality).lgwin(lgwin), seed, 2, false);
+    }
+    // Over 1 MiB, told the size: English-like text may take 13 contexts.
+    let data = text(1_200_000, 13);
+    for (quality, lgwin, seed) in [(5, 19, 10), (6, 22, 11)] {
+        check_flushes(&data, Options::new(quality).lgwin(lgwin), seed, 4, true);
+    }
 }
 
 #[test]

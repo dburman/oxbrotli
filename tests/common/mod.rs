@@ -107,6 +107,56 @@ pub(crate) fn text(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Words of Greek, Russian and Chinese text, with some English and punctuation: letters of two
+/// and three bytes in UTF-8, where quality 5 and up code literals by context.
+const UTF8_WORDS: &[&str] = &[
+    "καλημέρα",
+    "κόσμε",
+    "λόγος",
+    "ήλιος",
+    "θάλασσα",
+    "ουρανός",
+    "άνθρωπος",
+    "πόλη",
+    "привет",
+    "мир",
+    "слово",
+    "солнце",
+    "море",
+    "человек",
+    "город",
+    "время",
+    "你好",
+    "世界",
+    "文字",
+    "太阳",
+    "大海",
+    "时间",
+    "the",
+    "of",
+    "2026",
+    "OK",
+];
+
+/// Multilingual UTF-8 text of `len` bytes (possibly ending inside a letter).
+pub(crate) fn utf8_text(len: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut out = Vec::with_capacity(len + 16);
+    while out.len() < len {
+        let w = UTF8_WORDS[rng.below(UTF8_WORDS.len() as u64) as usize];
+        out.extend_from_slice(w.as_bytes());
+        out.extend_from_slice(match rng.below(16) {
+            0 => ". ".as_bytes(),
+            1 => ", ".as_bytes(),
+            2 => "\n".as_bytes(),
+            3 => "。".as_bytes(),
+            _ => " ".as_bytes(),
+        });
+    }
+    out.truncate(len);
+    out
+}
+
 /// HTML-like markup with repeated structure and varying content.
 pub(crate) fn html(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = Rng::new(seed);
@@ -233,6 +283,7 @@ pub(crate) fn corpus() -> Vec<(String, Vec<u8>)> {
         ("ones-1k".into(), vec![b'a'; 1024]),
         ("zeros-300k".into(), vec![0; 300_000]),
         ("text-200k".into(), text(200_000, 2)),
+        ("utf8-text-200k".into(), utf8_text(200_000, 10)),
         ("html-500k".into(), html(500_000, 4)),
         ("css-100k".into(), css(100_000, 6)),
         ("js-200k".into(), js(200_000, 7)),

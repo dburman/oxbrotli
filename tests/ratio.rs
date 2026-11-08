@@ -21,10 +21,10 @@ const LIMIT: f64 = 1.005;
 /// A corpus entry's name and length, and per window our size and the reference's.
 type Row = (String, usize, Vec<(usize, usize)>);
 
-/// How much larger than the reference's an output of quality 5 or 6 may be, for now: 1%.
-/// Those qualities choose a context map for the literals, which we don't yet (B14).
-const CHAIN_LIMIT: f64 = 1.01;
-/// Bytes an output under 1 KiB may be over the limit: in 100 bytes one dictionary word is 4%,
+/// How much larger than the reference's a web-sized body at quality 5 or 6 may be: 1% (they
+/// come out within 0.5%; quality 4's [`SMALL_LIMIT`] is wider for its word choice).
+const CHAIN_SMALL_LIMIT: f64 = 1.01;
+/// Bytes an output of quality 5 or 6 under 1 KiB may be over the limit: in 100 bytes one dictionary word is 4%,
 /// and from quality 5 the reference's tuned choice of short words decides (see B12 in
 /// `docs/plan/README.md`).
 const SMALL_SLACK: usize = 4;
@@ -40,7 +40,7 @@ fn quality_4_is_within_the_limit_of_the_reference() {
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn quality_5_is_within_the_limit_of_the_reference() {
-    let (report, over) = corpus_within(5, &[10, 15, 19], CHAIN_LIMIT, SMALL_SLACK);
+    let (report, over) = corpus_within(5, &[10, 15, 19], LIMIT, SMALL_SLACK);
     println!("{report}");
     assert!(over.is_empty(), "over the limit: {over:?}");
 }
@@ -48,7 +48,7 @@ fn quality_5_is_within_the_limit_of_the_reference() {
 #[test]
 #[ignore = "slow; run by scripts/gate --ratio"]
 fn quality_6_is_within_the_limit_of_the_reference() {
-    let (report, over) = corpus_within(6, &[10, 15, 19], CHAIN_LIMIT, SMALL_SLACK);
+    let (report, over) = corpus_within(6, &[10, 15, 19], LIMIT, SMALL_SLACK);
     println!("{report}");
     assert!(over.is_empty(), "over the limit: {over:?}");
 }
@@ -144,7 +144,7 @@ fn web_sized_bodies_at_quality_5_and_6_are_within_the_limit_of_the_reference() {
         let (report, worst) = web_sized(quality);
         println!("{report}");
         assert!(
-            worst.0 <= CHAIN_LIMIT,
+            worst.0 <= CHAIN_SMALL_LIMIT,
             "quality {quality}: {} is {:+.2}% larger",
             worst.1,
             (worst.0 - 1.0) * 100.0
@@ -203,10 +203,10 @@ fn web_sized(quality: u32) -> (String, (f64, String)) {
 
 /// How much larger than the reference's a real response may be, compressed as served.
 const REAL_LIMIT: f64 = 1.01;
-/// The same at qualities 5 and 6, for now (owner's choice, 2026-11-07): the reference's tuned
-/// choice of dictionary words weighs more when two are looked up per position, up to 1.2% on
-/// dictionary-heavy pages at windows 14 and 15 (see B13 in `docs/plan/README.md`). Revisited
-/// after B14.
+/// The same at qualities 5 and 6 (owner's choice, 2026-11-07, kept after B14 on 2026-11-08):
+/// the reference's tuned choice of dictionary words weighs more when two are looked up per
+/// position, up to 1.2% on dictionary-heavy pages at windows 14 and 15, which both code with
+/// one literal context (see B13 and B14 in `docs/plan/README.md`).
 const CHAIN_REAL_LIMIT: f64 = 1.015;
 
 /// Files in `bench-data/` (real responses, kept locally), each at the window

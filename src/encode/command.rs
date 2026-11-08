@@ -47,12 +47,22 @@ pub(crate) const MAX_DISTANCE: u32 = (1 << 26) - 4;
 
 /// One insert-and-copy command (§5): `insert` literals, then `copy` bytes from `distance`
 /// back. A `copy` of 0 is no copy: only the last command of a meta-block, ending after its
-/// inserts, may have it (the decoder then reads no distance).
+/// inserts, may have it (the decoder then reads no distance). For a dictionary word, `copy` is
+/// the word's length and `cut` the bytes its transform drops from the end, so the copy writes
+/// `copy - cut` bytes; otherwise `cut` is 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Command {
     pub(crate) insert: u32,
     pub(crate) copy: u32,
     pub(crate) distance: DistanceCode,
+    pub(crate) cut: u8,
+}
+
+impl Command {
+    /// The bytes the copy writes.
+    pub(crate) fn copied(&self) -> usize {
+        (self.copy - u32::from(self.cut)) as usize
+    }
 }
 
 /// The length code for `len` from a table of the first length of each code.

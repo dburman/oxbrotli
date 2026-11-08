@@ -646,6 +646,100 @@ mod tests {
         );
     }
 
+    /// Maps as the encoder writes them, read back: NTREES, then the map.
+    fn read_back(map: &[u8], trees: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut w = crate::bitwriter::BitWriter::new(&mut out);
+        crate::encode::write_context_map(&mut w, map, trees);
+        w.finish();
+        let mut r = BitReader::new(&out);
+        assert_eq!(read_count_256(&mut r), Ok(trees as u32));
+        let mut got = vec![0; map.len()];
+        Decoder::default()
+            .read_context_map_into(&mut r, &mut got, trees as u32)
+            .unwrap();
+        got
+    }
+
+    #[test]
+    fn context_maps_take_the_largest_run_prefix_up_to_6() {
+        // The prefix is the longest zero run's (after move-to-front) bit length less one, at
+        // most 6; none for runs of one.
+        for (zeros, prefix) in [(0, 0), (1, 0), (2, 1), (5, 2), (63, 5), (64, 6), (500, 6)] {
+            // 0 then 1 repeated: move-to-front makes the repeats zeros. Then 2, 3, ... to end.
+            let map: Vec<u8> = [0]
+                .into_iter()
+                .chain(std::iter::repeat_n(1, zeros + 1))
+                .chain(2..10)
+                .collect();
+            let mut out = Vec::new();
+            let mut w = crate::bitwriter::BitWriter::new(&mut out);
+            crate::encode::write_context_map(&mut w, &map, 10);
+            w.finish();
+            let mut r = BitReader::new(&out);
+            assert_eq!(read_count_256(&mut r), Ok(10));
+            let got = if r.bit().unwrap() {
+                r.bits(4).unwrap() + 1
+            } else {
+                0
+            };
+            assert_eq!(got, prefix, "a run of {zeros}");
+            assert_eq!(read_back(&map, 10), map);
+        }
+    }
+
+    #[test]
+    fn context_maps_the_encoder_writes_read_back() {
+        use crate::encode::context::{COMPLEX, SIMPLE};
+        // The static maps, for every number of block types they can have.
+        for (static_map, n) in [(&SIMPLE, 2), (&COMPLEX, 13)] {
+            for types in 1..=256 / n {
+                let map: Vec<u8> = (0..types)
+                    .flat_map(|t| static_map.iter().map(move |&c| (t * n) as u8 + c))
+                    .collect();
+                assert_eq!(
+                    read_back(&map, types * n),
+                    map,
+                    "{n} contexts, {types} types"
+                );
+            }
+        }
+        // Random maps of 1 to 256 trees, each tree used, some with long runs of one tree.
+        let mut x = 12_345u32;
+        let mut next = |m: usize| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as usize % m
+        };
+        for trees in 1..=256usize {
+            let len = 64 * (1 + next(8)).max(trees.div_ceil(64));
+            let mut map: Vec<u8> = (0..len).map(|i| (i % trees) as u8).collect();
+            for i in (1..len).rev() {
+                map.swap(i, next(i + 1));
+            }
+            if trees % 3 == 0 {
+                // A run as long as a meta-block's map can have: zeros after move-to-front,
+                // more than one longest-run symbol says.
+                let at = next(len);
+                let run = next(len - at) + 1;
+                let v = map[at];
+                map[at..at + run].fill(v);
+            }
+            assert_eq!(read_back(&map, trees), map, "{trees} trees");
+        }
+        // Zero runs around what one run-length symbol says at the largest prefix, 6: up to
+        // 127, and 128 on takes two.
+        for zeros in [62, 63, 64, 126, 127, 128, 129, 254, 255, 256, 257, 1000] {
+            let map: Vec<u8> = std::iter::once(0).chain(vec![1; zeros + 1]).collect();
+            assert_eq!(read_back(&map, 2), map, "a run of {zeros}");
+        }
+        // The longest run: one tree's 64 * 256 entries but the first.
+        let mut map = vec![1u8; 64 * 256];
+        map[0] = 0;
+        assert_eq!(read_back(&map, 2), map);
+    }
+
     #[test]
     fn counts_up_to_256_follow_the_rfc_table() {
         // (pattern as printed in §9.2 with x bits filled, value); 0110111 is 12.

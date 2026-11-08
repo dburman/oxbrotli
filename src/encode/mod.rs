@@ -3,6 +3,7 @@
 
 pub(crate) mod chain;
 pub(crate) mod command;
+pub(crate) mod context;
 pub(crate) mod forgetful;
 pub(crate) mod hash;
 pub(crate) mod histogram;
@@ -18,6 +19,7 @@ use crate::tables::{
     BLOCK_COUNT_BASE, BLOCK_COUNT_EXTRA, COPY_BASE, COPY_EXTRA, INSERT_BASE, INSERT_EXTRA,
 };
 use command::{Coded, Command};
+use context::Model;
 use huffman::Code;
 use metablock::Split;
 
@@ -288,53 +290,166 @@ fn write_trivial_context_map(w: &mut BitWriter<'_>, types: usize, context_bits: 
     w.put(1, 1); // IMTF
 }
 
-/// The three categories' splits for a meta-block of `commands` and `literals`: greedy block
-/// splits when `split`, else one block each.
-fn plan(literals: &[u8], commands: &[Command], coded: &[Coded], split: bool) -> [Split; 3] {
-    if split {
-        let mut l = metablock::Splitter::literals();
-        let mut c = metablock::Splitter::commands();
-        let mut d = metablock::Splitter::distances();
-        let mut next = 0;
-        for (cmd, k) in commands.iter().zip(coded) {
-            c.add(k.code as usize);
-            for &b in &literals[next..next + cmd.insert as usize] {
+/// Writes NTREES and `map`, the context map of a category, whose values are below `trees`
+/// (§7.3), as the reference's `EncodeContextMap`: move-to-front, runs of zeros coded with
+/// prefixes up to 6, a code for the result, then the symbols.
+pub(crate) fn write_context_map(w: &mut BitWriter<'_>, map: &[u8], trees: usize) {
+    write_count_256(w, trees);
+    if trees == 1 {
+        return;
+    }
+    // Move-to-front: each value as its index in a list of the values, most recent first.
+    let mut order: Vec<u8> = (0..=255).collect();
+    let moved: Vec<u32> = map
+        .iter()
+        .map(|&v| {
+            let mut i = 0;
+            while order[i] != v {
+                i += 1;
+            }
+            order.copy_within(..i, 1);
+            order[0] = v;
+            i as u32
+        })
+        .collect();
+    // Zero runs: a run of `n` is prefix code `log2(n)` and its bits below the top one, while
+    // `n < 2 << rle_max`; a longer run takes `rle_max` with all its bits set, the most one
+    // symbol says, and goes on. Other values move up by `rle_max`.
+    let mut longest = 0u32;
+    let mut run = 0;
+    for &v in &moved {
+        run = if v == 0 { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let rle_max = if longest == 0 {
+        0
+    } else {
+        longest.ilog2().min(6)
+    };
+    let mut symbols: Vec<(u32, u32)> = Vec::with_capacity(moved.len());
+    let mut i = 0;
+    while i < moved.len() {
+        if moved[i] != 0 {
+            symbols.push((moved[i] + rle_max, 0));
+            i += 1;
+            continue;
+        }
+        let mut reps = moved[i..].iter().take_while(|&&v| v == 0).count() as u32;
+        i += reps as usize;
+        while reps >= 2 << rle_max {
+            symbols.push((rle_max, (1 << rle_max) - 1));
+            reps -= (2 << rle_max) - 1;
+        }
+        let prefix = reps.ilog2();
+        symbols.push((prefix, reps - (1 << prefix)));
+    }
+    w.put(1, u32::from(rle_max > 0));
+    if rle_max > 0 {
+        w.put(4, rle_max - 1);
+    }
+    let alphabet = trees + rle_max as usize;
+    let mut counts = vec![0u32; alphabet];
+    for &(s, _) in &symbols {
+        counts[s as usize] += 1;
+    }
+    let code = Code::from_counts(&counts, MAX_LENGTH);
+    store::store(w, &code, alphabet);
+    for (s, extra) in symbols {
+        let s = s as usize;
+        w.put(u32::from(code.lengths[s]), u32::from(code.codes[s]));
+        if (1..=rle_max as usize).contains(&s) {
+            w.put(s as u32, extra);
+        }
+    }
+    w.put(1, 1); // IMTF
+}
+
+/// A meta-block's literals, and how they are coded: by `model`, and with more than one
+/// context, each literal's folded context in `contexts`.
+struct Literals<'a> {
+    bytes: &'a [u8],
+    model: Model,
+    contexts: Vec<u8>,
+}
+
+impl<'a> Literals<'a> {
+    /// The literals `bytes` of the meta-block `data`, whose inserts and copies are
+    /// `commands`, coded by `model`. A literal's context is the two bytes before it in the
+    /// stream: `prev` holds the two before `data` (the last first, 0 at the stream's start).
+    fn new(
+        bytes: &'a [u8],
+        data: &[u8],
+        prev: [u8; 2],
+        commands: &[Command],
+        model: Model,
+    ) -> Self {
+        let mut contexts = Vec::new();
+        if model.count > 1 {
+            contexts.reserve(bytes.len());
+            let before = |i: usize, back: usize| {
+                if i >= back {
+                    data[i - back]
+                } else {
+                    prev[back - i - 1]
+                }
+            };
+            let mut pos = 0;
+            for c in commands {
+                let insert = c.insert as usize;
+                contexts
+                    .extend((pos..pos + insert).map(|i| model.context(before(i, 1), before(i, 2))));
+                pos += insert + c.copied();
+            }
+            debug_assert_eq!(pos, data.len(), "the commands cover the meta-block");
+        }
+        Self {
+            bytes,
+            model,
+            contexts,
+        }
+    }
+}
+
+/// The three categories' greedy block splits for a meta-block of `commands` and `literals`;
+/// the literals' with a histogram per context.
+fn plan(literals: &Literals<'_>, commands: &[Command], coded: &[Coded]) -> [Split; 3] {
+    let mut l = metablock::Splitter::literals(literals.model.count);
+    let mut c = metablock::Splitter::commands();
+    let mut d = metablock::Splitter::distances();
+    let mut next = 0;
+    for (cmd, k) in commands.iter().zip(coded) {
+        c.add(k.code as usize);
+        let range = next..next + cmd.insert as usize;
+        if literals.contexts.is_empty() {
+            for &b in &literals.bytes[range] {
                 l.add(b as usize);
             }
-            next += cmd.insert as usize;
-            if k.reads_distance(cmd) {
-                d.add(cmd.distance.code as usize);
+        } else {
+            for (&b, &ctx) in literals.bytes[range.clone()]
+                .iter()
+                .zip(&literals.contexts[range])
+            {
+                l.add_in(b as usize, usize::from(ctx));
             }
         }
-        return [l.finish(), c.finish(), d.finish()];
-    }
-    let mut literal_counts = vec![0u32; LITERALS];
-    for &b in literals {
-        literal_counts[b as usize] += 1;
-    }
-    let mut command_counts = vec![0u32; COMMANDS];
-    let mut distance_counts = vec![0u32; DISTANCES];
-    for (c, k) in commands.iter().zip(coded) {
-        command_counts[k.code as usize] += 1;
-        if k.reads_distance(c) {
-            distance_counts[c.distance.code as usize] += 1;
+        next += cmd.insert as usize;
+        if k.reads_distance(cmd) {
+            d.add(cmd.distance.code as usize);
         }
     }
-    [
-        Split::single(literal_counts),
-        Split::single(command_counts),
-        Split::single(distance_counts),
-    ]
+    [l.finish(), c.finish(), d.finish()]
 }
 
 /// Writes a compressed meta-block of `mlen` bytes: `commands`, whose inserts take `literals`
 /// in order, with block types as `splits` (literals, commands, distances) give them.
-/// `NPOSTFIX = 0` and `NDIRECT = 0`; each literal block type has one code for all its
-/// contexts, and each distance block type one for its four.
-fn write_compressed(
+/// `NPOSTFIX = 0` and `NDIRECT = 0`; each literal block type has a code per context of its
+/// model, and each distance block type one for its four. `BY_CONTEXT` is whether the model
+/// has more than one context: each case gets its own copy of the per-literal loop, so that
+/// quality 4's stays as tight as before contexts.
+fn write_compressed<const BY_CONTEXT: bool>(
     w: &mut BitWriter<'_>,
     mlen: usize,
-    literals: &[u8],
+    literals: &Literals<'_>,
     commands: &[Command],
     coded: &[Coded],
     splits: &mut [Split; 3],
@@ -343,9 +458,13 @@ fn write_compressed(
     // Counts tuned for run-length coded lengths, then the codes (§3.5), per block type.
     let mut codes: [Vec<Code>; 3] = Default::default();
     for (split, codes) in splits.iter_mut().zip(&mut codes) {
+        let contexts = split.contexts;
         for counts in &mut split.counts {
-            histogram::optimize_for_rle(counts);
-            codes.push(Code::from_counts(counts, MAX_LENGTH));
+            let alphabet = counts.len() / contexts;
+            for counts in counts.chunks_exact_mut(alphabet) {
+                histogram::optimize_for_rle(counts);
+                codes.push(Code::from_counts(counts, MAX_LENGTH));
+            }
         }
     }
     let [literal_split, command_split, distance_split] = &*splits;
@@ -368,10 +487,20 @@ fn write_compressed(
     let mut distance_blocks = Blocks::write_header(w, distance_split);
     w.put(2, 0); // NPOSTFIX
     w.put(4, 0); // NDIRECT >> NPOSTFIX
+    let n = literals.model.count;
     for _ in 0..literal_split.num_types() {
-        w.put(2, 0); // context mode LSB6: with one code per type, any mode would do
+        // With one code per type any mode would do: LSB6, as quality 4 always wrote.
+        w.put(2, if n > 1 { u32::from(context::UTF8) } else { 0 });
     }
-    write_trivial_context_map(w, literal_split.num_types(), 6);
+    if n > 1 {
+        // Each type's contexts on its own `n` codes, folded by the model's map.
+        let map: Vec<u8> = (0..literal_split.num_types())
+            .flat_map(|t| literals.model.map.iter().map(move |&c| (t * n) as u8 + c))
+            .collect();
+        write_context_map(w, &map, literal_codes.len());
+    } else {
+        write_trivial_context_map(w, literal_split.num_types(), 6);
+    }
     write_trivial_context_map(w, distance_split.num_types(), 2);
     for code in literal_codes {
         store::store(w, code, LITERALS);
@@ -400,15 +529,25 @@ fn write_compressed(
         } else {
             w.put(u32::from(COPY_EXTRA[0]), 0);
         }
-        let mut rest = &literals[next..next + c.insert as usize];
+        let mut rest = &literals.bytes[next..next + c.insert as usize];
+        let mut at = next;
         while !rest.is_empty() {
-            let (t, n) = literal_blocks.run(w, rest.len());
-            let words = &literal_words[t];
-            let (now, later) = rest.split_at(n);
-            for &b in now {
-                let word = words[usize::from(b)];
-                w.put(word >> 16, word & 0xffff);
+            let (t, run) = literal_blocks.run(w, rest.len());
+            let (now, later) = rest.split_at(run);
+            if BY_CONTEXT {
+                let words = &literal_words[t * n..(t + 1) * n];
+                for (&b, &ctx) in now.iter().zip(&literals.contexts[at..at + run]) {
+                    let word = words[usize::from(ctx)][usize::from(b)];
+                    w.put(word >> 16, word & 0xffff);
+                }
+            } else {
+                let words = &literal_words[t];
+                for &b in now {
+                    let word = words[usize::from(b)];
+                    w.put(word >> 16, word & 0xffff);
+                }
             }
+            at += run;
             rest = later;
         }
         next += c.insert as usize;
@@ -419,16 +558,19 @@ fn write_compressed(
             w.put(u32::from(c.distance.extra_bits), c.distance.extra);
         }
     }
-    debug_assert_eq!(next, literals.len(), "the inserts take every literal");
+    debug_assert_eq!(next, literals.bytes.len(), "the inserts take every literal");
 }
 
-/// Writes the meta-block holding `data`: compressed as `commands` and `literals`, or
-/// uncompressed if that is smaller (then, if `is_last`, an empty last meta-block follows).
-/// Returns whether it was written compressed: an uncompressed meta-block leaves the
-/// decoder's distance ring as it was, and the caller's has to match.
+/// Writes the meta-block holding `data`: compressed as `commands` and `literals`, the
+/// literals coded by `model`, or uncompressed if that is smaller (then, if `is_last`, an empty
+/// last meta-block follows). `prev` holds the two bytes before `data`, the last first (0 at
+/// the stream's start). Returns whether it was written compressed: an uncompressed meta-block
+/// leaves the decoder's distance ring as it was, and the caller's has to match.
 pub(crate) fn write_meta_block(
     w: &mut BitWriter<'_>,
     data: &[u8],
+    prev: [u8; 2],
+    model: Model,
     literals: &[u8],
     commands: &[Command],
     is_last: bool,
@@ -436,11 +578,17 @@ pub(crate) fn write_meta_block(
     let mark = w.mark();
     let offset = w.bit_offset();
     let coded: Vec<Coded> = commands.iter().map(Coded::new).collect();
-    let mut splits = plan(literals, commands, &coded, true);
-    write_compressed(
+    let literals = Literals::new(literals, data, prev, commands, model);
+    let mut splits = plan(&literals, commands, &coded);
+    let write = if literals.model.count > 1 {
+        write_compressed::<true>
+    } else {
+        write_compressed::<false>
+    };
+    write(
         w,
         data.len(),
-        literals,
+        &literals,
         commands,
         &coded,
         &mut splits,
@@ -536,7 +684,15 @@ mod tests {
         let mut out = Vec::new();
         let mut w = BitWriter::new(&mut out);
         write_window(&mut w, 22);
-        let compressed = write_meta_block(&mut w, data, &literals, commands, true);
+        let compressed = write_meta_block(
+            &mut w,
+            data,
+            [0, 0],
+            super::Model::ONE,
+            &literals,
+            commands,
+            true,
+        );
         w.finish();
         (out, compressed)
     }
@@ -546,6 +702,7 @@ mod tests {
             insert,
             copy,
             distance,
+            cut: 0,
         }
     }
 
@@ -569,6 +726,59 @@ mod tests {
         let (out, compressed) = stream(&data, &commands);
         assert!(compressed);
         assert_eq!(decompress(&out), data);
+    }
+
+    /// Greek text: two-byte letters, so a literal's context says much about it.
+    fn greek(len: usize) -> Vec<u8> {
+        let words = [
+            "καλημέρα ",
+            "κόσμε, ",
+            "λόγος ",
+            "ήλιος. ",
+            "θάλασσα ",
+            "ουρανός ",
+        ];
+        let mut x = 3u32;
+        let mut out = Vec::new();
+        while out.len() < len {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            out.extend_from_slice(words[(x >> 16) as usize % words.len()].as_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn literals_coded_by_context_read_back_after_the_bytes_before() {
+        use super::context::{COMPLEX, Model, SIMPLE};
+        // An uncompressed meta-block ending inside a letter, then a compressed one starting
+        // with its continuation byte: the first literals' contexts are the bytes before.
+        let mut all = greek(6000);
+        let cut = (1000..2000).find(|&i| all[i - 1] >= 0xc0).unwrap();
+        all.copy_within(cut + 500..cut + 1200, cut + 2000);
+        let (prefix, data) = all.split_at(cut);
+        // Literals, a copy (whose last bytes give the next literals' context), literals.
+        let commands = [
+            command(2000, 700, DistanceCode::explicit(1500)),
+            command(data.len() as u32 - 2700, 0, DistanceCode::LAST),
+        ];
+        let literals = [&data[..2000], &data[2700..]].concat();
+        let mut sizes = Vec::new();
+        for (count, map) in [(1, &[0; 64]), (2, &SIMPLE), (13, &COMPLEX)] {
+            let model = Model { count, map };
+            let mut out = Vec::new();
+            let mut w = BitWriter::new(&mut out);
+            write_window(&mut w, 22);
+            super::write_uncompressed(&mut w, prefix);
+            let prev = [prefix[cut - 1], prefix[cut - 2]];
+            assert!(write_meta_block(
+                &mut w, data, prev, model, &literals, &commands, true
+            ));
+            w.finish();
+            assert_eq!(decompress(&out), all, "{count} contexts");
+            sizes.push(out.len());
+        }
+        assert!(sizes[1] < sizes[0], "contexts pay on Greek text: {sizes:?}");
     }
 
     #[test]

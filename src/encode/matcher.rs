@@ -15,6 +15,7 @@
 use crate::bitwriter::BitWriter;
 use crate::encode::chain::{self, Chain};
 use crate::encode::command::{Command, DistanceCode, Ring};
+use crate::encode::context::{self, Model};
 use crate::encode::forgetful::Forgetful;
 use crate::encode::hash::{Finder, H4, H54, Hasher, MIN_SCORE, Match, Params, match_length};
 use crate::encode::{Level, MAX_MLEN, write_empty_last, write_meta_block, write_window};
@@ -61,6 +62,10 @@ pub(crate) struct Encoder {
     max_backward: usize,
     /// Where the meta-block being built starts.
     flushed: usize,
+    /// The level, and the stream's size as hinted (0 if not known), which decide how
+    /// literals are coded by context.
+    level: Level,
+    size_hint: usize,
     commands: Vec<Command>,
     literals: Vec<u8>,
     /// Literals after the last command, not yet in one.
@@ -82,6 +87,8 @@ impl Encoder {
             saved_ring: Ring::START,
             max_backward: 0,
             flushed: 0,
+            level,
+            size_hint: 0,
             commands: Vec::new(),
             literals: Vec::new(),
             pending: 0,
@@ -139,6 +146,8 @@ impl Encoder {
         self.saved_ring = Ring::START;
         self.max_backward = (1 << lgwin) - WINDOW_GAP;
         self.flushed = 0;
+        self.level = level;
+        self.size_hint = size_hint.unwrap_or(0);
         self.commands.clear();
         self.literals.clear();
         self.pending = 0;
@@ -350,6 +359,7 @@ impl Encoder {
             insert: self.pending as u32,
             copy: m.len_code as u32,
             distance,
+            cut: (m.len_code - m.len) as u8,
         });
         self.pending = 0;
     }
@@ -363,12 +373,23 @@ impl Encoder {
                 insert: self.pending as u32,
                 copy: 0,
                 distance: DistanceCode::LAST,
+                cut: 0,
             });
             self.pending = 0;
         }
+        let data = &src[self.flushed..end];
+        // From quality 5, literals may be coded by context, as the reference decides per
+        // meta-block (`DecideOverLiteralContextModeling`).
+        let model = match self.level {
+            Level::Q4 => Model::ONE,
+            Level::Q5 | Level::Q6 => context::decide(data, self.size_hint),
+        };
+        let before = |back: usize| self.flushed.checked_sub(back).map_or(0, |i| src[i]);
         let compressed = write_meta_block(
             w,
-            &src[self.flushed..end],
+            data,
+            [before(1), before(2)],
+            model,
             &self.literals,
             &self.commands,
             is_last,

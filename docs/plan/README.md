@@ -29,7 +29,7 @@ qualities come after.
 | B11 Quality levels | `Options::quality` chooses the encoder: 5 and 6 get their own, 0-4 compress as 4, 7-11 as 6 | Tests pin the mapping; quality 4 output unchanged | Done 2026-11-06 |
 | B12 Chain hashers | H5 and H6: buckets of the last 2^(q-1) positions; four last distances tried; two dictionary words per position | Ratio within 1% of `brotli -q 5` / `-q 6` at window 19, with one literal context | Done 2026-11-06: corpus -0.00% in total at both; real files +0.68% (q5), web bodies -0.12% |
 | B13 Forgetful chains | H40 for windows of 16 or less | Ratio within 1% of the reference at windows 10 and 15 | Done 2026-11-08: -0.78% to +0.07% per entry; web bodies -0.13% |
-| B14 Context modeling | Literal contexts (UTF-8 mode): the choice of 1, 2 or 13 contexts, the context block splitter, context maps written in full | Ratio within 0.5% of `brotli -q 5` / `-q 6` at windows 10, 15 and 19 | Not started |
+| B14 Context modeling | Literal contexts (UTF-8 mode): the choice of 1, 2 or 13 contexts, the context block splitter, context maps written in full | Ratio within 0.5% of `brotli -q 5` / `-q 6` at windows 10, 15 and 19 | Done 2026-11-08: corpus -0.03% in total at both; real files +0.04% (q5), +0.09% (q6) |
 | B15 Release | Speed and memory at 5 and 6 measured; docs; 0.2.0 | `docs/benchmarks.md` has quality 5 and 6 rows; gate passes | Not started |
 
 
@@ -1034,6 +1034,58 @@ Tests:
 
 Done when: the gate passes and the ratio tests pass at those limits.
 Stop and ask if: 0.5% isn't reachable; report the gap per entry and what it comes from.
+
+Notes (2026-11-08):
+- *The decision.* `src/encode/context.rs`: per meta-block, as the reference's
+  `DecideOverLiteralContextModeling`, from 64 bytes sampled every 4096. 13 contexts for a
+  stream hinted at 1 MiB or more when they save 0.2 bits per byte on the top 5 bits and leave
+  at most 3; else 2 when knowing that the byte before was a lead byte saves 0.2 bits on the
+  top 2; else 1. The three-context map is never chosen below quality 7, so it isn't there.
+  The entropies are checked against values worked out apart from the code. The size hint
+  matters: the `brotli` tool hints only when given a file (`c/tools/brotli.c`), so compare
+  against it with a file, never through a pipe (through one, inputs of 1 MiB or more came
+  out "1% to 5% smaller" than the reference's).
+- *The static maps.* Row 0 of the 13-context map ORs the two bytes' classes, and `LUT1` puts
+  lead bytes of three or four bytes in class 2: context 12 is where a continuation byte comes
+  next (after any lead byte, or inside a three-byte letter), 11 where a letter is complete.
+- *The splitter.* One histogram per (type, context), the entropy differences summed over the
+  contexts, at most 256 / n types. The reference's per-context entropies are always replaced
+  together, so one sum per type decides the same. With one context it is the old splitter.
+- *Writing.* A literal's context is from the two bytes before it in the stream: after a copy,
+  the copied bytes (a dictionary word cut by its transform counts as the bytes it gives,
+  `Command::cut`), and at a meta-block's start the bytes before it (0 at the stream's start).
+  With one context the context mode stays LSB6 and the map trivial, so quality 4 writes what
+  it did: byte for byte on 96 files (corpus, `bench-data/`, the reference's test data, and
+  generated Greek, Russian, Chinese and English) at 5 windows, hinted and not; three streams
+  are now pinned in `tests/compress.rs`.
+- *Ratio* (ours against `brotli -q 5` / `-q 6`): generated corpus -0.03% in total at both, no
+  entry over 0.3% but the 100-byte text (2 to 4 bytes); a new multilingual UTF-8 entry within
+  0.05%. Web-sized bodies -0.13% (q5) and -0.15% (q6), worst +0.41%. Generated Greek of 1.5 MB
+  within 5 bytes of the reference at every window, English of 2 MiB within 0.06%, the 1.1 MB
+  script from +1.25% to -0.38%..+0.07%. `bench-data/` as served: +0.04% in total (q5), +0.09%
+  (q6); three dictionary-heavy pages at windows 14 and 15 stay over 1% (`nightsky` +1.22%,
+  `zoologist` +1.14%, `weather` +1.02% at q5; two at q6 just over). The reference codes them
+  with one literal context as we do: the gap is its tuned word choice (B13 notes). The owner
+  kept the 1.5% limit for real files at 5 and 6 (2026-11-08).
+- *Interop.* Generated UTF-8 and English at qualities 5 and 6, windows 10 to 24, one shot and
+  streamed with flushes every 3 pieces, hinted and not: none failed `brotli -d`. The flush
+  tests now include UTF-8 text (meta-blocks starting inside a letter) and a hinted 1.2 MB
+  stream, which reach 1, 2 and 13 contexts.
+- *Speed.* Quality 4 first lost 1% to 3% (small pages most): the context branch in the
+  per-literal loop. The meta-block writer is now generic over whether literals are coded by
+  context, each case with its own loop, and quality 4 is back within noise of before.
+  Quality 5 is 1% to 4% slower where it codes by two contexts and 7% to 12% with 13 (more
+  histograms to weigh per block, as the reference's); B15 measures it against the reference.
+- *Mutations.* 28 tried, all killed by the tests: map entries (a row, a column, the
+  two-context map), the sampling (stride spacing, a stride's first byte or two, the byte
+  classes, the top 5 bits, the two-prefix grouping, 64 bytes the least), the thresholds (gain
+  0.1 or 0.4, the entropy cap off or at 2), the 1 MiB hint and the hint dropped, the decision
+  off, the splitter (256 types at any context count, entropies not per context, contexts
+  ignored), the map writer (run prefix 5 or none, a run of exactly 128), the mode (LSB6 with
+  contexts, UTF-8 at quality 4), and the literal contexts (a cut word's length, context 0
+  written, the bytes before a meta-block swapped or zero). Twelve first survived the unit
+  tests as written, which only used inputs far from every edge; the tests added for them
+  measure exact entropies, thresholds, lengths and runs at the edges.
 
 ---
 

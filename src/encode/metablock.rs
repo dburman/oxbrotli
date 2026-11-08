@@ -1,7 +1,9 @@
 //! Block splitting (RFC 7932 §6): each category's symbols cut into blocks, each block given a
 //! type with its own prefix code. Quality 4 does it greedily, as the reference does
 //! (`c/enc/metablock_inc.h`, `BlockSplitter`; `c/enc/metablock.c`,
-//! `BrotliBuildMetaBlockGreedy`).
+//! `BrotliBuildMetaBlockGreedy`). From quality 5 literals may also be split by context
+//! (`ContextBlockSplitter`): each type then has a histogram per context, and a block's fit to a
+//! type is summed over them.
 
 use crate::encode::histogram::bits_entropy;
 
@@ -9,25 +11,16 @@ use crate::encode::histogram::bits_entropy;
 const MAX_TYPES: usize = 256;
 
 /// A category's blocks: the type and the symbol count of each, the number of types, and the
-/// symbol counts of each type.
+/// symbol counts of each type: `contexts` histograms in a row, one per context.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Split {
     pub(crate) types: Vec<u8>,
     pub(crate) lengths: Vec<u32>,
     pub(crate) counts: Vec<Vec<u32>>,
+    pub(crate) contexts: usize,
 }
 
 impl Split {
-    /// One block of one type, for all the symbols counted in `counts`.
-    pub(crate) fn single(counts: Vec<u32>) -> Self {
-        let total = counts.iter().sum();
-        Self {
-            types: vec![0],
-            lengths: vec![total],
-            counts: vec![counts],
-        }
-    }
-
     pub(crate) fn num_types(&self) -> usize {
         self.counts.len()
     }
@@ -36,17 +29,22 @@ impl Split {
 /// The greedy splitter for one category.
 pub(crate) struct Splitter {
     alphabet: usize,
+    /// Histograms per type, one per context.
+    contexts: usize,
+    /// At most this many types: 256 codes in all.
+    max_types: usize,
     /// Each block holds at least this many symbols.
     min_block: usize,
     /// Bits a new type must save to be made.
     threshold: f64,
     split: Split,
-    /// The counts of the block being collected.
+    /// The counts of the block being collected, per context.
     current: Vec<u32>,
     size: usize,
     /// The size at which the current block is decided.
     target: usize,
-    /// The last two types used, most recent first, and their entropies.
+    /// The last two types used, most recent first, and their entropies (summed over the
+    /// contexts).
     last: [usize; 2],
     last_entropy: [f64; 2],
     /// Joins of the last type in a row.
@@ -54,17 +52,20 @@ pub(crate) struct Splitter {
 }
 
 impl Splitter {
-    fn new(alphabet: usize, min_block: usize, threshold: f64) -> Self {
+    fn new(alphabet: usize, contexts: usize, min_block: usize, threshold: f64) -> Self {
         Self {
             alphabet,
+            contexts,
+            max_types: MAX_TYPES / contexts,
             min_block,
             threshold,
             split: Split {
                 types: Vec::new(),
                 lengths: Vec::new(),
                 counts: Vec::new(),
+                contexts,
             },
-            current: vec![0; alphabet],
+            current: vec![0; alphabet * contexts],
             size: 0,
             target: min_block,
             last: [0, 0],
@@ -73,25 +74,38 @@ impl Splitter {
         }
     }
 
-    pub(crate) fn literals() -> Self {
-        Self::new(256, 512, 400.0)
+    /// The literal splitter, with a histogram per type for each of `contexts` (1 to 13).
+    pub(crate) fn literals(contexts: usize) -> Self {
+        debug_assert!((1..=13).contains(&contexts), "{contexts} contexts");
+        Self::new(256, contexts, 512, 400.0)
     }
 
     pub(crate) fn commands() -> Self {
-        Self::new(704, 1024, 500.0)
+        Self::new(704, 1, 1024, 500.0)
     }
 
     pub(crate) fn distances() -> Self {
-        Self::new(64, 512, 100.0)
+        Self::new(64, 1, 512, 100.0)
     }
 
     #[inline]
     pub(crate) fn add(&mut self, symbol: usize) {
-        self.current[symbol] += 1;
+        self.add_in(symbol, 0);
+    }
+
+    /// Adds `symbol`, seen in `context`.
+    #[inline]
+    pub(crate) fn add_in(&mut self, symbol: usize, context: usize) {
+        self.current[context * self.alphabet + symbol] += 1;
         self.size += 1;
         if self.size == self.target {
             self.finish_block();
         }
+    }
+
+    /// The bits `counts` take, coded per context.
+    fn entropy(&self, counts: &[u32]) -> f64 {
+        counts.chunks_exact(self.alphabet).map(bits_entropy).sum()
     }
 
     /// Decides the block collected so far: a new type, the second-last type again, or more of
@@ -99,38 +113,44 @@ impl Splitter {
     fn finish_block(&mut self) {
         // The first and the final block count as at least the minimum, as the reference's do.
         let size = self.size.max(self.min_block) as u32;
-        let split = &mut self.split;
-        if split.types.is_empty() {
+        if self.split.types.is_empty() {
+            self.last_entropy = [self.entropy(&self.current); 2];
+            let split = &mut self.split;
             split.types.push(0);
             split.lengths.push(size);
-            self.last_entropy = [bits_entropy(&self.current); 2];
-            split
-                .counts
-                .push(std::mem::replace(&mut self.current, vec![0; self.alphabet]));
+            split.counts.push(std::mem::replace(
+                &mut self.current,
+                vec![0; self.alphabet * self.contexts],
+            ));
             self.size = 0;
             return;
         }
-        let entropy = bits_entropy(&self.current);
+        let entropy = self.entropy(&self.current);
         let combined: [Vec<u32>; 2] = self.last.map(|t| {
-            split.counts[t]
+            self.split.counts[t]
                 .iter()
                 .zip(&self.current)
                 .map(|(a, b)| a + b)
                 .collect()
         });
-        let combined_entropy = [bits_entropy(&combined[0]), bits_entropy(&combined[1])];
+        let combined_entropy = [self.entropy(&combined[0]), self.entropy(&combined[1])];
+        let split = &mut self.split;
         let diff = [
             combined_entropy[0] - entropy - self.last_entropy[0],
             combined_entropy[1] - entropy - self.last_entropy[1],
         ];
         let [first, second] = combined;
-        if split.counts.len() < MAX_TYPES && diff[0] > self.threshold && diff[1] > self.threshold {
+        if split.counts.len() < self.max_types
+            && diff[0] > self.threshold
+            && diff[1] > self.threshold
+        {
             let new = split.counts.len();
             split.types.push(new as u8);
             split.lengths.push(size);
-            split
-                .counts
-                .push(std::mem::replace(&mut self.current, vec![0; self.alphabet]));
+            split.counts.push(std::mem::replace(
+                &mut self.current,
+                vec![0; self.alphabet * self.contexts],
+            ));
             self.last = [new, self.last[0]];
             self.last_entropy = [entropy, self.last_entropy[0]];
             self.joins = 0;
@@ -176,7 +196,7 @@ mod tests {
     use super::{Split, Splitter};
 
     fn split_of(symbols: impl IntoIterator<Item = usize>) -> Split {
-        let mut s = Splitter::literals();
+        let mut s = Splitter::literals(1);
         for x in symbols {
             s.add(x);
         }
@@ -253,6 +273,73 @@ mod tests {
         let empty = split_of([]);
         check(&empty, 0);
         assert_eq!(empty.num_types(), 1);
+    }
+
+    #[test]
+    fn contexts_keep_a_histogram_each_and_split_together() {
+        // Two contexts, each with its own alphabet, the same throughout: one type, the
+        // symbols counted in their context's histogram.
+        let mut s = Splitter::literals(2);
+        for i in 0..20_000 {
+            if i % 2 == 0 {
+                s.add_in(usize::from(b'a') + i % 26, 0);
+            } else {
+                s.add_in(usize::from(b'0') + i % 10, 1);
+            }
+        }
+        let split = s.finish();
+        assert_eq!((split.num_types(), split.contexts), (1, 2));
+        let (first, second) = split.counts[0].split_at(256);
+        assert_eq!(first.iter().sum::<u32>(), 10_000);
+        assert_eq!(first[usize::from(b'0')..=usize::from(b'9')], [0; 10]);
+        assert_eq!(second.iter().sum::<u32>(), 10_000);
+        assert_eq!(
+            second[usize::from(b'0')..=usize::from(b'9')]
+                .iter()
+                .sum::<u32>(),
+            10_000
+        );
+        // A change in one context alone splits: the sum over contexts decides.
+        let mut s = Splitter::literals(2);
+        for i in 0..8192 {
+            let other = if i < 4096 { b'A' } else { b'0' };
+            let ctx = i % 2;
+            let b = if ctx == 0 {
+                b'a' + (i % 26) as u8
+            } else {
+                other + (i % 10) as u8
+            };
+            s.add_in(usize::from(b), ctx);
+        }
+        assert!(s.finish().num_types() >= 2);
+    }
+
+    #[test]
+    fn a_change_in_the_mix_of_contexts_alone_keeps_the_type() {
+        // Each context's symbols keep their spread, but the share of each context turns
+        // around halfway: coded per context, nothing changed, so one type.
+        let mut s = Splitter::literals(2);
+        for i in 0..20_000 {
+            let first = (i % 100 < 99) == (i < 10_000);
+            if first {
+                s.add_in(usize::from(b'a') + i % 26, 0);
+            } else {
+                s.add_in(usize::from(b'0') + i % 10, 1);
+            }
+        }
+        assert_eq!(s.finish().num_types(), 1);
+    }
+
+    #[test]
+    fn types_stop_at_256_codes_with_contexts() {
+        // 13 contexts: at most 19 types, 247 codes.
+        let mut s = Splitter::literals(13);
+        for i in 0..400 * 512 {
+            s.add_in((i / 512 * 37 + i % 3) % 256, i % 13);
+        }
+        let split = s.finish();
+        assert_eq!(split.num_types(), 256 / 13);
+        assert!(split.counts.iter().all(|c| c.len() == 13 * 256));
     }
 
     #[test]
