@@ -4,12 +4,13 @@
 //! reads and writes it without `unsafe` and without C: anything the reference `brotli` tool
 //! writes decompresses here, and anything this crate writes decompresses with the reference.
 //!
-//! **Status:** 0.2.0. Decompression works. Compression works at qualities 4, 5 and 6, as the
+//! **Status:** 0.2.1. Decompression works. Compression works at qualities 4, 5 and 6, as the
 //! reference compresses at each: on our test corpus the output is the same size, give or take
-//! 0.5% per entry, in one go or as a stream ([`StreamCompressor`]), at about the reference's
-//! speed. Quality 4 is the fastest; 5 searches further for matches and codes literals by
-//! context, for output 1% to 14% smaller at about 60% of the speed; 6 searches further still,
-//! another 1% to 6% smaller at about half 4's speed. Qualities 0 to 3 compress as 4 does, and
+//! 0.5% per entry (a few bytes on the smallest), in one go or as a stream
+//! ([`StreamCompressor`]), at about the reference's speed. Quality 4 is the fastest; 5
+//! searches further for matches and codes literals by context, for output 1% to 14% smaller at
+//! 56% to 72% of the speed; 6 searches further still, another 1% to 6% smaller at 45% to 69%
+//! of 4's speed. Qualities 0 to 3 compress as 4 does, and
 //! 7 to 11 as 6 does.
 //!
 //! ```

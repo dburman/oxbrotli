@@ -1,6 +1,6 @@
 [package]
 name = "oxbrotli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Brotli (RFC 7932) compression and decompression in safe Rust, with no dependencies"

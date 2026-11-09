@@ -20,21 +20,22 @@ separate implementation from the RFC:
 - **No dependencies and no C:** no C compiler in the build, nothing to cross-compile but
   Rust, and nothing else to audit.
 
-**Status:** 0.2.0. Decompression is complete: everything the reference
+**Status:** 0.2.1. Decompression is complete: everything the reference
 writes, at every quality and window, decodes byte for byte, and damaged input gives an error.
 Compression works at qualities 4, 5 and 6: on the test corpus the output is the size of
-`brotli -q 4`, `-q 5` and `-q 6`'s, give or take 0.5% per entry, and the reference decodes
-everything it writes, in one go or as a stream with flushes. Qualities 0 to 3 compress as 4
-does, and 7 to 11 as 6 does.
+`brotli -q 4`, `-q 5` and `-q 6`'s, give or take 0.5% per entry (a few bytes on the
+smallest), and the reference decodes everything it writes, in one go or as a stream with
+flushes. Qualities 0 to 3 compress as 4 does, and 7 to 11 as 6 does.
 
 | quality | output against 4 | speed against 4 | memory per compressor |
 |---|---|---|---|
 | 4 | | | sized to the body, up to 4 MiB |
-| 5 | 1% to 14% smaller | 55% to 70% | 512 KiB for small bodies, up to 2 MiB |
-| 6 | another 1% to 6% smaller | 42% to 57% | 512 KiB for small bodies, up to 4 MiB |
+| 5 | 1% to 14% smaller | 56% to 72% | 512 KiB for small bodies, up to 2 MiB |
+| 6 | another 1% to 6% smaller | 45% to 69% | 512 KiB for small bodies, up to 4 MiB |
 
-Both directions run at about the reference's speed, at every quality
-([`docs/benchmarks.md`](docs/benchmarks.md)).
+Both directions run at about the reference's speed, at every quality: compression at 96% to
+140% of it where measured (256 KiB and up; more on runs of one byte), decompression at 80% to
+119% (over twice on one very repetitive page) ([`docs/benchmarks.md`](docs/benchmarks.md)).
 See [`docs/plan/README.md`](docs/plan/README.md) for the milestones.
 
 ## Use
@@ -43,7 +44,7 @@ oxbrotli isn't on crates.io yet. Add it from Git:
 
 ```toml
 [dependencies]
-oxbrotli = { git = "https://github.com/dburman/oxbrotli", tag = "0.2.0" }
+oxbrotli = { git = "https://github.com/dburman/oxbrotli", tag = "0.2.1" }
 ```
 
 ```rust

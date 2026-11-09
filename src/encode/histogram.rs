@@ -28,11 +28,11 @@ pub(crate) fn bits_entropy(counts: &[u32]) -> f64 {
     let table = small_log2();
     let mut sum = 0u64;
     let mut bits = 0.0;
+    // No test for 0: its log2 is 0 in the table, so it adds exactly 0 to both, and a branch
+    // on it is a poor guess in a sparse histogram.
     for &c in counts {
-        if c != 0 {
-            sum += u64::from(c);
-            bits -= f64::from(c) * log2(table, c);
-        }
+        sum += u64::from(c);
+        bits -= f64::from(c) * log2(table, c);
     }
     if sum != 0 {
         bits += sum as f64 * (sum as f64).log2();

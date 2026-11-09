@@ -122,6 +122,7 @@ impl Finder for Chain {
         }
     }
 
+    #[inline(always)]
     fn find_longest_match(
         &mut self,
         data: &[u8],
@@ -132,6 +133,17 @@ impl Finder for Chain {
         best: &mut Match,
     ) {
         let start_score = best.score;
+        // The bucket first: on a large table it is the slow read, and this way it is under
+        // way while the last distances are tried (the reference prefetches it). A read of each
+        // of its cache lines, kept by `black_box` from being moved down to where it is used.
+        let key = self.hash(data, cur);
+        let bucket = key << self.block_bits;
+        let n = self.num[key];
+        let mut touch = self.buckets[bucket];
+        if self.block_bits > 4 {
+            touch ^= self.buckets[bucket + 16];
+        }
+        std::hint::black_box(touch);
         let here = &data[cur..cur + max_length];
         let mut best_len = best.len;
         // The last distances: a copy of 2 or 3 bytes is worth it from the first two.
@@ -165,10 +177,7 @@ impl Finder for Chain {
         }
         // From here a match needs 4 bytes: compare the 4 ending one past the best length.
         best_len = best_len.max(3);
-        let key = self.hash(data, cur);
-        let n = self.num[key];
         let mask = (1 << self.block_bits) - 1;
-        let bucket = key << self.block_bits;
         let oldest = usize::from(n).saturating_sub(1 << self.block_bits);
         for i in (oldest..usize::from(n)).rev() {
             let prev = self.buckets[bucket + (i & mask)] as usize;

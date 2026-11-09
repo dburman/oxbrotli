@@ -1,8 +1,6 @@
 //! Insert-and-copy commands (RFC 7932 §5) and distances (§4): their codes, and the encoder's
 //! copy of the decoder's distance ring.
 
-use crate::tables::{COPY_BASE, INSERT_BASE};
-
 /// A distance code and its extra bits (§4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DistanceCode {
@@ -65,9 +63,43 @@ impl Command {
     }
 }
 
-/// The length code for `len` from a table of the first length of each code.
-pub(crate) fn length_code(base: &[u32; 24], len: u32) -> usize {
+/// The length code for `len` from a table of the first length of each code: what
+/// `insert_code` and `copy_code` work out.
+#[cfg(test)]
+fn length_code(base: &[u32; 24], len: u32) -> usize {
     base.partition_point(|&b| b <= len) - 1
+}
+
+/// The insert length code (§5) for `len`. Past the first six, codes come in pairs whose extra
+/// bits grow by one a pair: from 6, a pair covers `2 << pair` lengths per code, so `len - 2`
+/// has its top bit at `pair + 2`, and the bit below picks the code of the pair. From 130 each
+/// code has a bit more than the last, then three wide ones.
+pub(crate) fn insert_code(len: u32) -> usize {
+    match len {
+        0..6 => len as usize,
+        6..130 => {
+            let extra = (len - 2).ilog2() - 1;
+            (2 * extra + ((len - 2) >> extra) + 2) as usize
+        }
+        130..2114 => ((len - 66).ilog2() + 10) as usize,
+        2114..6210 => 21,
+        6210..22594 => 22,
+        _ => 23,
+    }
+}
+
+/// The copy length code (§5) for `len`, from 2: as `insert_code`, with the pairs from 10 and
+/// the codes of a bit more each from 134.
+pub(crate) fn copy_code(len: u32) -> usize {
+    match len {
+        0..10 => len.saturating_sub(2) as usize,
+        10..134 => {
+            let extra = (len - 6).ilog2() - 1;
+            (2 * extra + ((len - 6) >> extra) + 4) as usize
+        }
+        134..2118 => ((len - 70).ilog2() + 12) as usize,
+        _ => 23,
+    }
 }
 
 /// The cell (§5) of insert codes `8 * i..` and copy codes `8 * c..` among cells 2..=10, the
@@ -95,13 +127,9 @@ pub(crate) struct Coded {
 
 impl Coded {
     pub(crate) fn new(c: &Command) -> Self {
-        let insert_code = length_code(&INSERT_BASE, c.insert);
+        let insert_code = insert_code(c.insert);
         // No copy: copy code 0, whose length the decoder never gets to.
-        let copy_code = if c.copy == 0 {
-            0
-        } else {
-            length_code(&COPY_BASE, c.copy)
-        };
+        let copy_code = if c.copy == 0 { 0 } else { copy_code(c.copy) };
         let last = c.copy == 0 || c.distance.code == 0;
         Self {
             code: command_code(insert_code, copy_code, last),
@@ -202,8 +230,35 @@ impl Ring {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistanceCode, EXPLICIT_CELL, MAX_DISTANCE, Ring, command_code};
-    use crate::tables::{COMMAND_CELLS, command_codes};
+    use super::{
+        DistanceCode, EXPLICIT_CELL, MAX_DISTANCE, Ring, command_code, copy_code, insert_code,
+        length_code,
+    };
+    use crate::tables::{COMMAND_CELLS, COPY_BASE, INSERT_BASE, command_codes};
+
+    #[test]
+    fn length_codes_are_the_tables() {
+        // Every length to 30,000, each code's first length and the one before it, and the
+        // longest the decoder takes.
+        let lengths = (0..30_000)
+            .chain(
+                INSERT_BASE
+                    .iter()
+                    .chain(&COPY_BASE)
+                    .flat_map(|&b| [b.max(1) - 1, b, b + 1]),
+            )
+            .chain([1 << 20, 16_799_808, 16_799_809, 16_779_332, 16_779_333]);
+        for len in lengths {
+            assert_eq!(
+                insert_code(len),
+                length_code(&INSERT_BASE, len),
+                "insert {len}"
+            );
+            if len >= 2 {
+                assert_eq!(copy_code(len), length_code(&COPY_BASE, len), "copy {len}");
+            }
+        }
+    }
 
     #[test]
     fn every_command_code_is_found_again() {

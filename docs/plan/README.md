@@ -31,6 +31,7 @@ qualities come after.
 | B13 Forgetful chains | H40 for windows of 16 or less | Ratio within 1% of the reference at windows 10 and 15 | Done 2026-11-08: -0.78% to +0.07% per entry; web bodies -0.13% |
 | B14 Context modeling | Literal contexts (UTF-8 mode): the choice of 1, 2 or 13 contexts, the context block splitter, context maps written in full | Ratio within 0.5% of `brotli -q 5` / `-q 6` at windows 10, 15 and 19 | Done 2026-11-08: corpus -0.03% in total at both; real files +0.04% (q5), +0.09% (q6) |
 | B15 Release | Speed and memory at 5 and 6 measured; docs; 0.2.0 | `docs/benchmarks.md` has quality 5 and 6 rows; gate passes | Done 2026-11-08: 5 and 6 at 100% to 117% of the reference's speed; tag on the owner's word |
+| B16 Large real input | The 1.1 MB real script at 91% to 93% of the reference's speed at 5 and 6: profile, fix, rerun the full benchmark; real responses in `docs/benchmarks.md`; 0.2.1 | Output unchanged; gate passes | Done 2026-11-09: 96% to 100% on it (7% to 9% faster), generated inputs at 110% to 126%; tags (H58/H68) tried and dropped |
 
 
 Qualities 5 and 6 are B11 to B15 (planned 2026-11-06). Later and not scheduled: the other
