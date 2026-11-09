@@ -12,7 +12,7 @@ categories = ["compression"]
 publish = false
 # What a user of the crate needs: the code, its tests and examples. CI, lint and supply-chain
 # configuration, the toolchain pin and the scripts stay in the repository.
-include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/LICENSE"]
+include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/LICENSE", "/NOTICE"]
 
 # Its own workspace, also when checked out inside another one (as a submodule, say).
 [workspace]

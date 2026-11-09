@@ -1,0 +1,85 @@
+oxbrotli
+Copyright (c) 2026 Douglas Burman. MIT License: see LICENSE.
+
+oxbrotli is written from the Brotli specification. It includes data from that
+specification, and some numeric settings chosen to match the reference
+implementation, credited here.
+
+
+1. RFC 7932, "Brotli Compressed Data Format"
+   J. Alakuijala and Z. Szabadka, July 2016
+   https://www.rfc-editor.org/rfc/rfc7932
+
+   Taken from the RFC's text by scripts/extract-rfc.py, and checked against the
+   lengths and CRC-32s the RFC gives:
+
+   - src/dictionary.bin: the static dictionary (Appendix A)
+   - src/dictionary_tables.rs: the dictionary's word counts (NDBITS, Appendix
+     A) and the 121 word transforms (Appendix B)
+   - src/context_lut.rs: the context lookup tables (section 7.1)
+
+   And from the RFC's tables: the insert, copy and block count codes
+   (src/tables.rs, sections 5 and 6), the code length code order and lengths
+   (section 3.5) and the initial distances (section 4).
+
+   The RFC is subject to BCP 78 and the IETF Trust's Legal Provisions Relating
+   to IETF Documents (https://trustee.ietf.org/license-info). Code Components
+   extracted from it are licensed under the Simplified BSD License:
+
+   Copyright (c) 2016 IETF Trust and the persons identified as authors of the
+   code. All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are met:
+
+   - Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+   - Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+   - Neither the name of Internet Society, IETF or IETF Trust, nor the names of
+     specific contributors, may be used to endorse or promote products derived
+     from this software without specific prior written permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+   IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+   FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+   CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+2. The reference implementation, google/brotli
+   https://github.com/google/brotli
+
+   No code is copied from it. To compress as it does, oxbrotli uses the same
+   numeric settings: hash multipliers, the scores and penalties that rank
+   matches, the block splitter's thresholds and block sizes, the thresholds
+   that choose literal context modeling, histogram tuning constants, and the
+   hash table sizes per quality. The same static dictionary also ships with it.
+
+   Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+   THE SOFTWARE.

@@ -87,4 +87,6 @@ are added to the test corpus.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The static dictionary and other tables come from RFC 7932, and
+some numeric settings match the reference implementation's: both are credited, with their
+licenses, in [NOTICE](NOTICE).
